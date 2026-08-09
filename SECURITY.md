@@ -272,3 +272,16 @@ exact controlled HTTPS URLs.
   **LDAP/AD federation**, or a scheduled diff against the org directory), since
   pure OIDC brokering can't pull deletions. Once that sets `enabled=false`, the
   reconciler does the rest automatically.
+- **Destructive-edit teardown (machine identities).** Removing a service account
+  or team from `personas.yaml` now **destroys** the backend identity + access:
+  the reconciler tracks what it provisioned (`state/service_accounts_state.json`)
+  and, on the next `ensure-sas`/`deprovision` pass, for a removed SA it **revokes
+  its UC grants + deletes the Keycloak client + deletes its Vault secret**, and
+  for a removed team it **deletes the `team-<team>` role + group** (members' data
+  grants are revoked by the normal human reconcile). This closes the orphan gap
+  where a removed SA/team previously left grants, a Keycloak client, and a Vault
+  secret behind. **Data is explicitly out of scope:** catalogs/schemas are NEVER
+  auto-dropped when removed from the `namespace` block — that is data, not access,
+  and irreversible; drop them manually/explicitly. Verified: provisioning then
+  removing a throwaway team destroyed its SA (grants+client+secret) and its
+  role+group, with the platform smoke harness still green.

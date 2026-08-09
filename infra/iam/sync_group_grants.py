@@ -75,6 +75,12 @@ VAULT_MOUNT = os.environ.get("VAULT_KV_MOUNT", "secret")
 VAULT_SA_PREFIX = os.environ.get("VAULT_SA_PREFIX", "platform/sa")
 STATE_DIR = HERE / "state"
 STATE_FILE = STATE_DIR / "group_grants_state.json"
+# Tracks which service accounts + teams the reconciler has provisioned, so that
+# REMOVING one from personas.yaml triggers a full teardown (revoke grants +
+# delete Keycloak client/role/group + delete Vault secret) -- destructive edits
+# to the policy destroy the backend identity/access. (Catalogs/schemas are NEVER
+# auto-dropped -- that is data, not access, and irreversible.)
+SA_STATE_FILE = STATE_DIR / "service_accounts_state.json"
 
 
 def team_role_name(team: str) -> str:
@@ -609,9 +615,135 @@ def reconcile_service_accounts(dry_run: bool = False) -> tuple[int, int]:
 
 
 def ensure_sas(dry_run: bool = False) -> None:
-    """Provision SA clients/secrets/principals, then reconcile their grants."""
+    """Provision SA clients/secrets/principals, reconcile their grants, then
+    DEPROVISION anything removed from personas.yaml (destructive-edit teardown)."""
     ensure_service_accounts()
     reconcile_service_accounts(dry_run=dry_run)
+    deprovision_removed(dry_run=dry_run)
+
+
+# --------------------------------------------------------------------------- #
+# destructive-edit teardown: removing a service account / team from personas.yaml
+# destroys the backend identity + access (revoke grants, delete Keycloak client/
+# role/group, delete Vault secret). Tracked via a small state file so we only act
+# on things we previously provisioned. NEVER drops catalogs/schemas (data).
+# --------------------------------------------------------------------------- #
+def _load_sa_state() -> dict:
+    if SA_STATE_FILE.exists():
+        return json.loads(SA_STATE_FILE.read_text())
+    return {"sas": {}, "teams": []}
+
+
+def _save_sa_state(state: dict) -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    SA_STATE_FILE.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n")
+
+
+def _current_sa_state() -> dict:
+    """What personas.yaml currently declares: SA client_id -> {persona, team}
+    plus the set of teams."""
+    sas = {cid: {"persona": persona, "team": team}
+           for cid, persona, team in _sa_specs()}
+    return {"sas": sas, "teams": sorted(TEAMS.keys())}
+
+
+def _vault_delete_sa(client_id: str) -> bool:
+    """Permanently delete an SA secret (all versions) from Vault."""
+    url = f"{VAULT_ADDR}/v1/{VAULT_MOUNT}/metadata/{VAULT_SA_PREFIX}/{client_id}"
+    req = urllib.request.Request(url, method="DELETE",
+                                 headers={"X-Vault-Token": VAULT_TOKEN})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return r.status in (200, 204)
+    except urllib.error.HTTPError as e:
+        return e.code == 404  # already gone == success
+
+
+def _delete_client(token: str, client_id: str) -> bool:
+    cid = _find_client(token, client_id)
+    if cid is None:
+        return False
+    status, _ = sa._kc_admin_call("DELETE", f"/clients/{cid}", token)
+    return status in (204, 200)
+
+
+def _delete_group(token: str, gname: str) -> bool:
+    gid = _group_id(token, gname)
+    if gid is None:
+        return False
+    status, _ = sa._kc_admin_call("DELETE", f"/groups/{gid}", token)
+    return status in (204, 200)
+
+
+def _delete_realm_role(token: str, role: str) -> bool:
+    status, _ = sa._kc_admin_call("GET", f"/roles/{role}", token)
+    if status != 200:
+        return False
+    status, _ = sa._kc_admin_call("DELETE", f"/roles/{role}", token)
+    return status in (204, 200)
+
+
+def _destroy_service_account(token: str, client_id: str, meta: dict,
+                             dry_run: bool = False) -> None:
+    sa_email = f"{client_id}@platform.local"
+    persona = (meta or {}).get("persona")
+    team = (meta or {}).get("team")
+    # Revoke the SA's last-known persona grants (precise); fall back to the union.
+    p = PERSONAS["personas"].get(persona) if persona else None
+    if p:
+        scope = {"team": [team]} if (team and "team" in NS.dimensions) else None
+        grants = NS.expand(p["grants"], scope=scope)
+    else:
+        grants = list(_all_persona_grants().values())
+    if dry_run:
+        print(f"  [DEPROVISION][DRY] SA {client_id}: revoke {len(grants)} grant(s) "
+              f"+ delete Keycloak client + delete Vault secret")
+        return
+    nr = sum(1 for g in grants if _revoke_grant(sa_email, g))
+    kc = _delete_client(token, client_id)
+    vs = _vault_delete_sa(client_id) if _vault_available() else False
+    print(f"  [DEPROVISION] SA {client_id}: -{nr} grant(s), kc_client_deleted={kc}, "
+          f"vault_secret_deleted={vs}")
+    sa.audit(action="deprovision_service_account", client_id=client_id,
+             grants_revoked=nr, kc_deleted=kc, vault_deleted=vs)
+
+
+def _destroy_team(token: str, team: str, dry_run: bool = False) -> None:
+    role = team_role_name(team)
+    gname = team_group_name(team)
+    if dry_run:
+        print(f"  [DEPROVISION][DRY] team {team}: delete group '{gname}' + role '{role}'")
+        return
+    g = _delete_group(token, gname)
+    r = _delete_realm_role(token, role)
+    # Members' team data grants are revoked by the normal human reconcile (the
+    # team drops out of `desired`); this removes the launch role + group.
+    print(f"  [DEPROVISION] team {team}: group_deleted={g}, role_deleted={r} "
+          f"(member data grants revoked by reconcile)")
+    sa.audit(action="deprovision_team", team=team, group_deleted=g, role_deleted=r)
+
+
+def deprovision_removed(dry_run: bool = False) -> tuple[int, int]:
+    """Destroy any SA/team present in the state file but no longer declared in
+    personas.yaml. First run seeds state (no deletes)."""
+    prev = _load_sa_state()
+    cur = _current_sa_state()
+    removed_sas = set(prev.get("sas", {})) - set(cur["sas"])
+    removed_teams = set(prev.get("teams", [])) - set(cur["teams"])
+    if not removed_sas and not removed_teams:
+        if not dry_run:
+            _save_sa_state(cur)
+        return 0, 0
+    token = sa._kc_admin_token()
+    for cid in sorted(removed_sas):
+        _destroy_service_account(token, cid, prev.get("sas", {}).get(cid), dry_run)
+    for team in sorted(removed_teams):
+        _destroy_team(token, team, dry_run)
+    if not dry_run:
+        _save_sa_state(cur)
+    print(f"  [deprovision] destroyed {len(removed_sas)} service account(s), "
+          f"{len(removed_teams)} team(s){' [dry-run]' if dry_run else ''}")
+    return len(removed_sas), len(removed_teams)
 
 
 def _disabled_members(token: str) -> dict:
@@ -754,8 +886,10 @@ def main() -> int:
     sub.add_parser("ensure-groups", help="create KC groups + attach realm roles")
     sub.add_parser("ensure-teams", help="create team launch roles + team groups")
     sub.add_parser("bootstrap", help="ensure the declared catalogs + schemas exist in UC")
-    es = sub.add_parser("ensure-sas", help="provision declared service accounts + reconcile their grants")
+    es = sub.add_parser("ensure-sas", help="provision declared SAs + reconcile grants + deprovision removed")
     es.add_argument("--dry-run", action="store_true")
+    dp = sub.add_parser("deprovision", help="destroy SAs/teams removed from personas.yaml (teardown only)")
+    dp.add_argument("--dry-run", action="store_true")
     rp = sub.add_parser("reconcile", help="reconcile UC grants from membership")
     rp.add_argument("--dry-run", action="store_true")
     am = sub.add_parser("add-member")
@@ -782,6 +916,8 @@ def main() -> int:
         bootstrap_namespace()
     elif cmd == "ensure-sas":
         ensure_sas(dry_run=a.dry_run)
+    elif cmd == "deprovision":
+        deprovision_removed(dry_run=a.dry_run)
     elif cmd == "reconcile":
         reconcile(dry_run=a.dry_run)
     elif cmd == "add-member":

@@ -98,8 +98,8 @@ DAGSTER_TOKEN=$(vault token create -policy=dagster-read -period=768h -field=toke
 # personas.yaml, so it needs create/read/update on the SA secret path (scoped to
 # secret/platform/sa/* only -- it cannot read core/oidc secrets).
 cat >/tmp/reconciler.hcl <<'EOF'
-path "secret/data/platform/sa/*"     { capabilities = ["create", "read", "update"] }
-path "secret/metadata/platform/sa/*" { capabilities = ["read", "list"] }
+path "secret/data/platform/sa/*"     { capabilities = ["create", "read", "update", "delete"] }
+path "secret/metadata/platform/sa/*" { capabilities = ["read", "list", "delete"] }
 EOF
 vault policy write reconciler-sa /tmp/reconciler.hcl >/dev/null
 RECON_TOKEN=$(vault token create -policy=reconciler-sa -period=768h -field=token)
