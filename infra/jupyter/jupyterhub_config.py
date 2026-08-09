@@ -119,12 +119,30 @@ def _ensure_user_workspace(username: str) -> None:
                 shutil.copy2(src, user_dir)
             except OSError:
                 pass
+    # Seed a per-user EDITABLE copy of the dbt project on first login so dev
+    # happens in-place (each user edits + runs their own models). profiles.yml
+    # ships inside it; `uc-dbt` supplies the per-user UC token at run time so
+    # Unity Catalog enforces THAT user's grants.
+    dbt_src = os.environ.get("DBT_PROJECT_TEMPLATE", "/opt/dbt-project")
+    dbt_dst = os.path.join(user_dir, "dbt")
+    if os.path.isdir(dbt_src) and not os.path.isdir(dbt_dst):
+        try:
+            shutil.copytree(
+                dbt_src, dbt_dst,
+                ignore=shutil.ignore_patterns("target", "dbt_packages", "logs", "*.duckdb"),
+            )
+        except OSError:
+            pass
 
 
 async def pre_spawn_hook(spawner):
     """Give the user an isolated workspace and inject their Keycloak tokens so
     uc_notebook.uc_session() can act as that user."""
     _ensure_user_workspace(spawner.user.name)
+    # Point dbt at the user's own project copy (profiles.yml lives inside it).
+    user_dbt = os.path.join(NOTEBOOKS_ROOT, spawner.user.name, "dbt")
+    spawner.environment["DBT_PROJECT_DIR"] = user_dbt
+    spawner.environment["DBT_PROFILES_DIR"] = user_dbt
     auth_state = await spawner.user.get_auth_state()
     if not auth_state:
         return

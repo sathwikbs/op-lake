@@ -657,7 +657,11 @@ services:
     volumes:
       - ./infra/jupyter/jupyterhub_config.py:/srv/jupyterhub/jupyterhub_config.py:ro
       - ./infra/jupyter/uc_notebook.py:/opt/nbtools/uc_notebook.py:ro
+      - ./infra/jupyter/uc-dbt:/usr/local/bin/uc-dbt:ro
       - ./infra/jupyter/notebooks:/home/dev/notebooks
+      # Read-only reference copy of the dbt project; the spawner seeds a per-user
+      # editable copy into ~/dbt on first login (see jupyterhub_config.py).
+      - ./dbt:/opt/dbt-project:ro
       - connect_tls:/certs:ro
       - ./infra/secrets/inject.sh:/secrets/inject.sh:ro
       - secrets_render:/run/secrets-rendered:ro

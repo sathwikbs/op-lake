@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# uc-dbt -- run dbt inside JupyterHub AS THE LOGGED-IN USER.
+#
+# The compute edge holds no ambient identity: dbt can only touch data if it
+# presents YOUR Unity Catalog token. This wrapper mints that token from your
+# Keycloak identity (the same RFC 8693 exchange uc_notebook uses), exports it as
+# DBT_UC_TOKEN (which profiles.yml binds as the per-session UC catalog token),
+# and runs dbt against the shared Spark Connect server (SPARK_REMOTE). Unity
+# Catalog then enforces YOUR grants -- there is no admin/default profile.
+#
+# Usage (in a JupyterLab terminal):
+#     cd ~/dbt
+#     uc-dbt build                 # or: run / test / compile / ls ...
+#     uc-dbt run --select stg_orders
+set -euo pipefail
+
+# Mint the caller's Unity Catalog token from their injected Keycloak token.
+DBT_UC_TOKEN="$(python3 -c 'import sys, uc_notebook; sys.stdout.write(uc_notebook.uc_token())')"
+export DBT_UC_TOKEN
+
+# profiles.yml ships inside the dbt project; default to the per-user project dir
+# (set by the spawner) or the current directory.
+export DBT_PROFILES_DIR="${DBT_PROFILES_DIR:-${DBT_PROJECT_DIR:-$PWD}}"
+
+echo "[uc-dbt] running dbt as ${KC_USERNAME:-you} (UC-governed; profiles in ${DBT_PROFILES_DIR})" >&2
+exec dbt "$@"

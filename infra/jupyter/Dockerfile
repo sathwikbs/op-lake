@@ -15,6 +15,12 @@ ARG PYSPARK_VERSION=4.1.0
 
 ENV PIP_NO_CACHE_DIR=1 PYTHONUNBUFFERED=1 PYTHONWARNINGS=ignore
 
+# git: dev essential in the hosted env -- editing + committing dbt models and
+# `dbt deps` (package installs). (dbt debug also checks for it.)
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git \
+    && rm -rf /var/lib/apt/lists/*
+
 # JupyterLab + single-user server, Keycloak OAuthenticator, the Spark Connect
 # client, and data libs. Let pandas/pyarrow float to whatever pyspark[connect]
 # requires (avoids the resolver conflict seen when pinning them).
@@ -25,9 +31,12 @@ RUN python3 -m pip install --no-cache-dir \
       "pyspark[connect]==${PYSPARK_VERSION}" \
       pandas pyarrow matplotlib \
       grpcio grpcio-status \
-      "dlt==1.29.1"
-# ^ dlt matches the Dagster image so the custom UC-managed destination pattern in
-#   notebooks/01_dlt_uc_managed_ingestion.ipynb behaves identically to production.
+      "dlt==1.29.1" \
+      "dbt-core==1.10.22" "dbt-spark==1.10.3"
+# ^ dlt + dbt match the Dagster image so notebooks behave identically to
+#   production. dbt-spark uses method:session against SPARK_REMOTE (the shared
+#   Spark Connect server); pyspark[connect] above satisfies the session backend.
+#   Devs run `uc-dbt build` (see /usr/local/bin/uc-dbt) so dbt runs as THEM.
 
 # Per-user UC identity helper importable from any notebook (on PYTHONPATH).
 RUN mkdir -p /opt/nbtools /home/dev/notebooks
