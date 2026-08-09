@@ -24,7 +24,10 @@ RUN python3 -m pip install --no-cache-dir \
       oauthenticator \
       "pyspark[connect]==${PYSPARK_VERSION}" \
       pandas pyarrow matplotlib \
-      grpcio grpcio-status
+      grpcio grpcio-status \
+      "dlt==1.29.1"
+# ^ dlt matches the Dagster image so the custom UC-managed destination pattern in
+#   notebooks/01_dlt_uc_managed_ingestion.ipynb behaves identically to production.
 
 # Per-user UC identity helper importable from any notebook (on PYTHONPATH).
 RUN mkdir -p /opt/nbtools /home/dev/notebooks
