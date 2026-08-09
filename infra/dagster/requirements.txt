@@ -1,0 +1,30 @@
+# Dagster orchestration + dbt-over-Spark-Connect + Spark Connect client.
+#
+# Connect-first: pyspark[connect] is a PURE-PYTHON gRPC client (no JVM/JRE here).
+# It serves BOTH consumers, which is why the pin MUST equal the Spark server
+# version exactly (a client/server mismatch is the classic Spark Connect footgun):
+#   - Spark Connect CLIENT for the Dagster ingestion/transform assets (-> spark:15002)
+#   - dbt-spark's `session` method: builder.getOrCreate() honors SPARK_REMOTE and
+#     opens a remote Connect session to the same server (no in-process Spark, no JRE).
+dagster==1.11.*
+dagster-webserver==1.11.*
+dagster-postgres==0.27.*
+dagster-dbt==0.27.*
+
+dbt-core~=1.10.0
+dbt-spark[session]~=1.10.0
+
+# MUST match SPARK_VERSION in infra/spark/Dockerfile (currently 4.1.0).
+pyspark[connect]==4.1.0
+grpcio>=1.62
+grpcio-status>=1.62
+psycopg2-binary
+pandas
+pyarrow
+
+# Ingestion (dlt -> UC-managed Delta tables). dlt normalizes to Arrow; the custom
+# `uc_managed` destination (data_platform.uc_managed_destination) pushes the Arrow
+# batches through Spark Connect and writes governed, UC-MANAGED Delta tables via
+# the UC connector + credential vending -- no static/root key. (No delta-rs: only
+# Spark can write catalog-managed tables on released UC.)
+dlt[s3,parquet]>=1.5

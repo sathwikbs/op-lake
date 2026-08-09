@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Data Platform &mdash; Launchpad</title>
+  <style>
+    :root { --bg:#0b0f1a; --card:#141a2b; --edge:#26304a; --fg:#e8edf7; --muted:#9aa7c2; --accent:#6ea8fe; --good:#4ade80; }
+    * { box-sizing: border-box; }
+    body { margin:0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+           color: var(--fg);
+           background: radial-gradient(1000px 500px at 15% -10%, #17213b, transparent), var(--bg); }
+    .wrap { max-width: 980px; margin: 0 auto; padding: 48px 24px 64px; }
+    header h1 { font-size: 28px; margin: 0 0 6px; }
+    header p { color: var(--muted); margin: 0 0 8px; max-width: 720px; line-height: 1.5; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 16px; margin-top: 28px; }
+    a.card { text-decoration: none; color: inherit; background: var(--card); border:1px solid var(--edge);
+             border-radius: 14px; padding: 18px 18px 16px; display:block; transition: transform .08s ease, border-color .08s ease; }
+    a.card:hover { transform: translateY(-2px); border-color: var(--accent); }
+    .card h3 { margin: 2px 0 6px; font-size: 17px; }
+    .card p { margin: 0; color: var(--muted); font-size: 13px; line-height: 1.45; }
+    .card .port { color: var(--accent); font-size: 12px; font-family: ui-monospace, monospace; overflow-wrap: anywhere; word-break: break-word; }
+    .card p { overflow-wrap: anywhere; }
+    .pill { display:inline-block; font-size: 11px; color: var(--good); border:1px solid #244; background:#0e2018;
+            border-radius: 999px; padding: 2px 8px; margin-bottom: 10px; }
+    section.iam { margin-top: 36px; background: var(--card); border:1px solid var(--edge); border-radius: 14px; padding: 20px 22px; }
+    section.iam h2 { margin: 0 0 10px; font-size: 18px; }
+    section.iam ul { margin: 8px 0 0; padding-left: 18px; color: var(--muted); line-height: 1.6; font-size: 14px; }
+    code { font-family: ui-monospace, monospace; color: var(--fg); background:#0e1526; padding:1px 6px; border-radius:6px; }
+    footer { color: var(--muted); font-size: 12px; margin-top: 28px; }
+    .card.admin { border-color: #b45309; }
+    .card.admin .port { color: #b45309; font-weight: 600; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <div class="pill">Single sign-on &middot; Unity Catalog is the one data authority</div>
+      <h1>Data Platform Launchpad</h1>
+      <p>One identity (Keycloak) across every tool. Sign in once; each app runs <strong>as you</strong> and
+         Unity Catalog enforces your grants at query time. The compute edge holds <em>no</em> ambient admin
+         identity &mdash; automation runs as team service accounts, humans run as themselves.</p>
+    </header>
+
+    <div class="grid">
+      <a class="card" href="https://superset.localtest.me" target="_blank" rel="noopener">
+        <div class="port">superset.localtest.me</div>
+        <h3>Superset &rarr;</h3>
+        <p>Dashboards &amp; SQL Lab. Per-user Spark Connect: your Keycloak token becomes a UC token, so you
+           only see data you're granted.</p>
+      </a>
+      <a class="card" href="https://jupyter.localtest.me" target="_blank" rel="noopener">
+        <div class="port">jupyter.localtest.me</div>
+        <h3>JupyterHub &rarr;</h3>
+        <p>Hosted notebooks, one per user. <code>import uc_notebook; uc_notebook.uc_session()</code> gives you a
+           Spark session that is you.</p>
+      </a>
+      <a class="card" href="https://dagster.localtest.me" target="_blank" rel="noopener">
+        <div class="port">dagster.localtest.me</div>
+        <h3>Dagster &rarr;</h3>
+        <p>Orchestration UI, behind Keycloak (oauth2-proxy). Access is inherited from your persona
+           (data-engineer / platform-admin). Pipelines run as team service accounts.</p>
+      </a>
+      <a class="card" href="https://keycloak.localtest.me/realms/datalake/account" target="_blank" rel="noopener">
+        <div class="port">my account</div>
+        <h3>My Account &rarr;</h3>
+        <p>Self-service: change <strong>your own</strong> password and view your active sessions. (This is the
+           per-user account page &mdash; not the Keycloak admin console, which lives on the admin page.)</p>
+      </a>
+    </div>
+
+    <section class="iam">
+      <h2>How access works</h2>
+      <ul>
+        <li><strong>One identity:</strong> Keycloak is the IdP; every tool uses OIDC SSO against the same realm.</li>
+        <li><strong>One data authority:</strong> Unity Catalog resolves your token to a principal and enforces
+            grants &mdash; the same rules whether you use Superset, Jupyter, Dagster or local dbt.</li>
+        <li><strong>Personas &amp; groups:</strong> membership of a Keycloak group grants a persona
+            (<code>analyst</code>, <code>data-engineer</code>, <code>platform-admin</code>); a reconciler
+            materializes it as per-principal UC grants and app-level roles.</li>
+        <li><strong>Automation vs humans:</strong> Dagster runs pipelines as team <em>service accounts</em>
+            (passwordless); people run as themselves. No shared admin behind anything.</li>
+        <li><strong>Local dev:</strong> <code>eval "$(bin/uc-login)"</code> then run <code>dbt</code> or a
+            notebook on your laptop as yourself.</li>
+      </ul>
+    </section>
+
+    <p style="margin-top:28px;">
+      <a href="/oauth2/sign_out?rd=https%3A%2F%2Fkeycloak.localtest.me%2Frealms%2Fdatalake%2Fprotocol%2Fopenid-connect%2Flogout%3Fclient_id%3Ddagster%26post_logout_redirect_uri%3Dhttps%3A%2F%2Fhome.localtest.me%2F"
+         style="color:var(--accent); font-size:14px; text-decoration:none;">Sign out (end your SSO session) &rarr;</a>
+    </p>
+    <footer>Local reference stack &middot; cloud-agnostic &middot; Unity Catalog &middot; Spark Connect &middot; Keycloak &middot; dbt &middot; Dagster &middot; Superset</footer>
+  </div>
+</body>
+</html>

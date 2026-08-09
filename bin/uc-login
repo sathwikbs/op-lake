@@ -1,0 +1,272 @@
+#!/usr/bin/env python3
+"""uc-login -- authenticate a LOCAL developer to Unity Catalog as themselves.
+
+The platform's compute edge holds zero ambient identity: a local `dbt` run or a
+local notebook can only touch data if it presents ITS OWN Unity Catalog token.
+`uc-login` gets you that token from Keycloak (passwordless device flow by
+default) and prints the environment that local dbt / notebooks need. Unity
+Catalog then enforces YOUR grants -- there is no admin profile to fall back to.
+
+Typical use:
+
+    eval "$(bin/uc-login)"          # device flow (opens a code in your browser)
+    eval "$(bin/uc-login --password)"   # local convenience: prompt user/pass
+    cd dbt && dbt build              # runs as YOU; UC enforces your persona
+    # local notebook: `import uc_notebook; uc_notebook.uc_session()`
+
+Commands:
+    (default) / login   authenticate, cache tokens, and print `export` lines
+    env                 re-print `export` lines (refreshing the UC token if stale)
+    status              show the cached identity and token freshness
+    logout              delete the cached credentials
+
+All endpoints are host-reachable published ports; override via env if needed:
+    KC_BASE (https://keycloak.localtest.me)  UC_BASE (http://localhost:8080)
+    REALM (datalake)  CLIENT_ID (datalake-cli)
+    SPARK_CONNECT_HOSTPORT (localhost:15002)  UC_CATALOG (analytics)
+"""
+from __future__ import annotations
+
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _from_env_file(key: str) -> str | None:
+    """Best-effort read of a key from the repo .env (so we can build SPARK_REMOTE
+    with the pre-shared Spark Connect token without the user exporting it)."""
+    env_path = REPO_ROOT / ".env"
+    if not env_path.exists():
+        return None
+    for line in env_path.read_text().splitlines():
+        line = line.strip()
+        if line.startswith(f"{key}="):
+            return line.split("=", 1)[1].strip()
+    return None
+
+
+KC_BASE = os.environ.get("KC_BASE", "https://keycloak.localtest.me")
+UC_BASE = os.environ.get("UC_BASE", "http://localhost:8080")
+REALM = os.environ.get("REALM", "datalake")
+CLIENT_ID = os.environ.get("CLIENT_ID", "datalake-cli")
+CATALOG = os.environ.get("UC_CATALOG", "analytics")
+SPARK_HOSTPORT = os.environ.get("SPARK_CONNECT_HOSTPORT", "localhost:15002")
+SPARK_CONNECT_TOKEN = (
+    os.environ.get("SPARK_CONNECT_TOKEN") or _from_env_file("SPARK_CONNECT_TOKEN") or ""
+)
+
+KC_TOKEN_URL = f"{KC_BASE}/realms/{REALM}/protocol/openid-connect/token"
+KC_DEVICE_URL = f"{KC_BASE}/realms/{REALM}/protocol/openid-connect/auth/device"
+UC_EXCHANGE_URL = f"{UC_BASE}/api/1.0/unity-control/auth/tokens"
+
+CACHE_DIR = Path(os.environ.get("UC_LOGIN_HOME", str(Path.home() / ".uc")))
+CACHE_FILE = CACHE_DIR / "credentials.json"
+
+
+# --------------------------------------------------------------------------- #
+def _post(url: str, form: dict) -> dict:
+    data = urllib.parse.urlencode(form).encode()
+    req = urllib.request.Request(
+        url, data=data, headers={"Content-Type": "application/x-www-form-urlencoded"}
+    )
+    with urllib.request.urlopen(req, timeout=60) as r:
+        return json.load(r)
+
+
+def _save(cred: dict) -> None:
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    CACHE_FILE.write_text(json.dumps(cred, indent=2) + "\n")
+    try:
+        CACHE_FILE.chmod(0o600)
+    except OSError:
+        pass
+
+
+def _load() -> dict | None:
+    if CACHE_FILE.exists():
+        return json.loads(CACHE_FILE.read_text())
+    return None
+
+
+def _claims(jwt: str) -> dict:
+    import base64
+
+    try:
+        p = jwt.split(".")[1]
+        p += "=" * (-len(p) % 4)
+        return json.loads(base64.urlsafe_b64decode(p))
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+# --------------------------------------------------------------------------- #
+# auth flows
+# --------------------------------------------------------------------------- #
+def _device_flow() -> dict:
+    init = _post(KC_DEVICE_URL, {"client_id": CLIENT_ID, "scope": "openid email profile"})
+    verify = init.get("verification_uri_complete") or init["verification_uri"]
+    print(f"To sign in, open:\n\n    {verify}\n", file=sys.stderr)
+    if not init.get("verification_uri_complete"):
+        print(f"and enter code: {init['user_code']}\n", file=sys.stderr)
+    interval = int(init.get("interval", 5))
+    deadline = time.time() + int(init.get("expires_in", 600))
+    while time.time() < deadline:
+        time.sleep(interval)
+        try:
+            return _post(KC_TOKEN_URL, {
+                "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+                "client_id": CLIENT_ID,
+                "device_code": init["device_code"],
+            })
+        except urllib.error.HTTPError as e:
+            body = json.loads(e.read().decode("utf-8", "replace") or "{}")
+            if body.get("error") in ("authorization_pending", "slow_down"):
+                continue
+            raise RuntimeError(f"device flow failed: {body}") from e
+    raise RuntimeError("device flow timed out")
+
+
+def _password_flow() -> dict:
+    import getpass
+
+    # Prompts go to stderr so `eval "$(uc-login --password)"` keeps stdout clean.
+    print("Username: ", end="", file=sys.stderr, flush=True)
+    user = input()
+    pw = getpass.getpass("Password: ", stream=sys.stderr)
+    return _post(KC_TOKEN_URL, {
+        "grant_type": "password", "client_id": CLIENT_ID,
+        "username": user, "password": pw, "scope": "openid email profile",
+    })
+
+
+def _exchange(kc_access: str) -> str:
+    r = _post(UC_EXCHANGE_URL, {
+        "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
+        "requested_token_type": "urn:ietf:params:oauth:token-type:access_token",
+        "subject_token_type": "urn:ietf:params:oauth:token-type:access_token",
+        "subject_token": kc_access,
+    })
+    tok = r.get("access_token")
+    if not tok:
+        raise RuntimeError(f"UC token exchange returned no access_token: {r}")
+    return tok
+
+
+def _cred_from_token_response(tok: dict) -> dict:
+    kc_access = tok["access_token"]
+    uc = _exchange(kc_access)
+    claims = _claims(kc_access)
+    return {
+        "username": claims.get("preferred_username") or claims.get("email") or "unknown",
+        "kc_access_token": kc_access,
+        "kc_refresh_token": tok.get("refresh_token", ""),
+        "uc_token": uc,
+        "obtained_at": int(time.time()),
+        "expires_in": int(tok.get("expires_in", 300)),
+    }
+
+
+def _refresh(cred: dict) -> dict:
+    rt = cred.get("kc_refresh_token")
+    if not rt:
+        raise RuntimeError("no refresh token cached; run `uc-login` again")
+    tok = _post(KC_TOKEN_URL, {
+        "grant_type": "refresh_token", "client_id": CLIENT_ID, "refresh_token": rt,
+    })
+    return _cred_from_token_response(tok)
+
+
+# --------------------------------------------------------------------------- #
+# output
+# --------------------------------------------------------------------------- #
+def _print_exports(cred: dict) -> None:
+    spark_remote = f"sc://{SPARK_HOSTPORT}/;token={SPARK_CONNECT_TOKEN}"
+    lines = {
+        "DBT_UC_TOKEN": cred["uc_token"],
+        "KC_ACCESS_TOKEN": cred["kc_access_token"],
+        "KC_REFRESH_TOKEN": cred["kc_refresh_token"],
+        "KC_USERNAME": cred["username"],
+        "SPARK_REMOTE": spark_remote,
+        "UC_CATALOG": CATALOG,
+        "UC_EXCHANGE_URL": UC_EXCHANGE_URL,
+        "KC_INTERNAL_TOKEN_URL": KC_TOKEN_URL,
+        "OIDC_CLIENT_ID": CLIENT_ID,
+        "OIDC_CLIENT_SECRET": "",  # public client -> no secret
+        "DBT_PROFILES_DIR": str(REPO_ROOT / "dbt"),
+    }
+    for k, v in lines.items():
+        print(f"export {k}={_shq(v)}")
+    # Make `import uc_notebook` work in local notebooks/REPLs (same helper the
+    # hosted hub uses). Preserve any existing PYTHONPATH.
+    nbtools = REPO_ROOT / "infra" / "jupyter"
+    print(f'export PYTHONPATH="{nbtools}${{PYTHONPATH:+:$PYTHONPATH}}"')
+    print(f"# logged in as {cred['username']}; UC token cached at {CACHE_FILE}",
+          file=sys.stderr)
+
+
+def _shq(v: str) -> str:
+    return "'" + str(v).replace("'", "'\"'\"'") + "'"
+
+
+def _fresh_or_refresh(cred: dict) -> dict:
+    age = time.time() - cred.get("obtained_at", 0)
+    if age > cred.get("expires_in", 300) - 30:
+        cred = _refresh(cred)
+        _save(cred)
+    return cred
+
+
+# --------------------------------------------------------------------------- #
+def main() -> int:
+    args = sys.argv[1:]
+    cmd = "login"
+    if args and args[0] in ("login", "env", "status", "logout"):
+        cmd, args = args[0], args[1:]
+
+    if cmd == "logout":
+        if CACHE_FILE.exists():
+            CACHE_FILE.unlink()
+        print("logged out (cached credentials removed)", file=sys.stderr)
+        return 0
+
+    if cmd == "status":
+        cred = _load()
+        if not cred:
+            print("not logged in", file=sys.stderr)
+            return 1
+        age = int(time.time() - cred.get("obtained_at", 0))
+        print(f"user={cred['username']} token_age={age}s "
+              f"(expires_in={cred.get('expires_in')}s) cache={CACHE_FILE}", file=sys.stderr)
+        return 0
+
+    if cmd == "env":
+        cred = _load()
+        if not cred:
+            print("# not logged in; run: eval \"$(bin/uc-login)\"", file=sys.stderr)
+            return 1
+        cred = _fresh_or_refresh(cred)
+        _print_exports(cred)
+        return 0
+
+    # login
+    try:
+        tok = _password_flow() if "--password" in args else _device_flow()
+        cred = _cred_from_token_response(tok)
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", "replace")[:300]
+        print(f"login failed (HTTP {e.code}): {body}", file=sys.stderr)
+        return 1
+    _save(cred)
+    _print_exports(cred)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

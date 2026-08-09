@@ -1,0 +1,349 @@
+{
+  "realm": "datalake",
+  "enabled": true,
+  "sslRequired": "none",
+  "registrationAllowed": false,
+  "loginWithEmailAllowed": true,
+  "duplicateEmailsAllowed": false,
+  "accessTokenLifespan": 3600,
+  "clients": [
+    {
+      "clientId": "unitycatalog",
+      "name": "Unity Catalog Server",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": true,
+      "secret": "__RENDER_UC_OIDC_CLIENT_SECRET__",
+      "redirectUris": [
+        "http://localhost:3000/*",
+        "http://localhost:8080/*",
+        "http://localhost/*",
+        "http://127.0.0.1:*"
+      ],
+      "webOrigins": ["*"],
+      "defaultClientScopes": ["profile", "email", "roles", "web-origins", "basic"],
+      "attributes": {
+        "post.logout.redirect.uris": "+"
+      }
+    },
+    {
+      "clientId": "platform-cli",
+      "name": "Platform M2M service account (IAM foundation test)",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "serviceAccountsEnabled": true,
+      "standardFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "secret": "__RENDER_PLATFORM_CLI_SECRET__",
+      "protocolMappers": [
+        {
+          "name": "aud-unitycatalog",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "config": {
+            "included.client.audience": "unitycatalog",
+            "id.token.claim": "false",
+            "access.token.claim": "true"
+          }
+        },
+        {
+          "name": "email-claim",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-hardcoded-claim-mapper",
+          "config": {
+            "claim.name": "email",
+            "claim.value": "platform-cli@platform.local",
+            "jsonType.label": "String",
+            "id.token.claim": "false",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "false"
+          }
+        }
+      ]
+    },
+    {
+      "clientId": "sa-platform-automation",
+      "name": "Platform automation service account (Dagster default automation plane)",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "serviceAccountsEnabled": true,
+      "standardFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "secret": "__RENDER_SA_PLATFORM_AUTOMATION_SECRET__",
+      "protocolMappers": [
+        {
+          "name": "aud-unitycatalog",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "config": {
+            "included.client.audience": "unitycatalog",
+            "id.token.claim": "false",
+            "access.token.claim": "true"
+          }
+        },
+        {
+          "name": "email-claim",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-hardcoded-claim-mapper",
+          "config": {
+            "claim.name": "email",
+            "claim.value": "sa-platform-automation@platform.local",
+            "jsonType.label": "String",
+            "id.token.claim": "false",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "false"
+          }
+        }
+      ]
+    },
+    {
+      "clientId": "minio",
+      "name": "MinIO (object-store OIDC / STS AssumeRoleWithWebIdentity + console SSO)",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false,
+      "secret": "__RENDER_MINIO_OIDC_CLIENT_SECRET__",
+      "redirectUris": ["https://minio-console.localtest.me/*"],
+      "webOrigins": ["*"],
+      "defaultClientScopes": ["profile", "email", "roles", "web-origins", "basic"],
+      "protocolMappers": [
+        {
+          "name": "minio-policy-from-client-roles",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-client-role-mapper",
+          "config": {
+            "usermodel.clientRoleMapping.clientId": "minio",
+            "claim.name": "minio_policy",
+            "jsonType.label": "String",
+            "multivalued": "true",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "true"
+          }
+        }
+      ]
+    },
+    {
+      "clientId": "superset",
+      "name": "Superset (BI human-plane SSO)",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": true,
+      "secret": "__RENDER_SUPERSET_OIDC_CLIENT_SECRET__",
+      "redirectUris": [
+        "https://superset.localtest.me/*"
+      ],
+      "webOrigins": ["*"],
+      "defaultClientScopes": ["profile", "email", "roles", "web-origins", "basic"],
+      "protocolMappers": [
+        {
+          "name": "aud-unitycatalog",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "config": {
+            "included.client.audience": "unitycatalog",
+            "id.token.claim": "false",
+            "access.token.claim": "true"
+          }
+        }
+      ]
+    },
+    {
+      "clientId": "jupyterhub",
+      "name": "JupyterHub (notebook human-plane SSO)",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": true,
+      "secret": "__RENDER_JUPYTERHUB_OIDC_CLIENT_SECRET__",
+      "redirectUris": [
+        "https://jupyter.localtest.me/*"
+      ],
+      "webOrigins": ["*"],
+      "defaultClientScopes": ["profile", "email", "roles", "web-origins", "basic"],
+      "protocolMappers": [
+        {
+          "name": "aud-unitycatalog",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "config": {
+            "included.client.audience": "unitycatalog",
+            "id.token.claim": "false",
+            "access.token.claim": "true"
+          }
+        }
+      ]
+    },
+    {
+      "clientId": "datalake-cli",
+      "name": "Datalake CLI (local dev: uc-login, local dbt, local notebooks)",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": true,
+      "standardFlowEnabled": false,
+      "directAccessGrantsEnabled": true,
+      "attributes": {
+        "oauth2.device.authorization.grant.enabled": "true"
+      },
+      "defaultClientScopes": ["profile", "email", "roles", "web-origins", "basic"],
+      "protocolMappers": [
+        {
+          "name": "aud-unitycatalog",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "config": {
+            "included.client.audience": "unitycatalog",
+            "id.token.claim": "false",
+            "access.token.claim": "true"
+          }
+        }
+      ]
+    },
+    {
+      "clientId": "dagster",
+      "name": "Dagster (orchestration UI, behind oauth2-proxy)",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": false,
+      "secret": "__RENDER_DAGSTER_OIDC_CLIENT_SECRET__",
+      "redirectUris": [
+        "https://dagster.localtest.me/oauth2/callback",
+        "https://admin.localtest.me/oauth2/callback",
+        "https://home.localtest.me/oauth2/callback"
+      ],
+      "attributes": {
+        "post.logout.redirect.uris": "https://home.localtest.me/*##https://admin.localtest.me/*##https://dagster.localtest.me/*"
+      },
+      "webOrigins": ["*"],
+      "defaultClientScopes": ["profile", "email", "roles", "web-origins", "basic"],
+      "protocolMappers": [
+        {
+          "name": "realm-roles-as-groups",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-realm-role-mapper",
+          "config": {
+            "claim.name": "groups",
+            "jsonType.label": "String",
+            "multivalued": "true",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "true"
+          }
+        }
+      ]
+    }
+  ],
+  "roles": {
+    "realm": [
+      { "name": "sa-creator", "description": "Delegated admin: may provision service accounts" },
+      { "name": "data-engineer", "description": "Persona: full builder across medallion layers" },
+      { "name": "analyst", "description": "Persona: read-only on the gold layer" },
+      { "name": "platform-admin", "description": "Persona: top-level platform administrator (Dagster UI, all teams)", "composite": true, "composites": { "realm": ["team-analytics"] } },
+      { "name": "team-analytics", "description": "Team scope: may launch the analytics team's Dagster pipelines" }
+    ],
+    "client": {
+      "minio": [
+        { "name": "platform-admin", "description": "Maps (via the minio_policy claim) to the MinIO platform-admin policy for console + STS access." }
+      ]
+    }
+  },
+  "users": [
+    {
+      "username": "engineer",
+      "enabled": true,
+      "emailVerified": true,
+      "email": "engineer@platform.local",
+      "firstName": "Data",
+      "lastName": "Engineer",
+      "credentials": [
+        { "type": "password", "value": "engineer", "temporary": true }
+      ],
+      "requiredActions": ["UPDATE_PASSWORD"],
+      "realmRoles": ["default-roles-datalake", "sa-creator", "data-engineer"],
+      "groups": ["/data-engineers", "/team-analytics"]
+    },
+    {
+      "username": "engineer2",
+      "enabled": true,
+      "emailVerified": true,
+      "email": "engineer2@platform.local",
+      "firstName": "Other",
+      "lastName": "Engineer",
+      "credentials": [
+        { "type": "password", "value": "engineer2", "temporary": true }
+      ],
+      "requiredActions": ["UPDATE_PASSWORD"],
+      "realmRoles": ["default-roles-datalake", "data-engineer"]
+    },
+    {
+      "username": "platformadmin",
+      "enabled": true,
+      "emailVerified": true,
+      "email": "platformadmin@platform.local",
+      "firstName": "Platform",
+      "lastName": "Admin",
+      "credentials": [
+        { "type": "password", "value": "platformadmin", "temporary": true }
+      ],
+      "requiredActions": ["UPDATE_PASSWORD"],
+      "realmRoles": ["default-roles-datalake", "sa-creator", "platform-admin"],
+      "groups": ["/platform-admins"]
+    },
+    {
+      "username": "analyst",
+      "enabled": true,
+      "emailVerified": true,
+      "email": "analyst@platform.local",
+      "firstName": "Data",
+      "lastName": "Analyst",
+      "credentials": [
+        { "type": "password", "value": "analyst", "temporary": false }
+      ],
+      "realmRoles": ["default-roles-datalake", "analyst"],
+      "groups": ["/analysts"]
+    }
+  ],
+  "groups": [
+    {
+      "name": "analysts",
+      "path": "/analysts",
+      "attributes": { "uc_persona": ["analyst"] },
+      "realmRoles": ["analyst"]
+    },
+    {
+      "name": "data-engineers",
+      "path": "/data-engineers",
+      "attributes": { "uc_persona": ["data-engineer"] },
+      "realmRoles": ["data-engineer", "sa-creator"]
+    },
+    {
+      "name": "platform-admins",
+      "path": "/platform-admins",
+      "attributes": { "uc_persona": ["platform-admin"] },
+      "realmRoles": ["sa-creator", "platform-admin"],
+      "_clientRoles_comment": "Delegated Keycloak user administration: members may create/edit users, set credentials, and manage each user's group MEMBERSHIP in the admin console (small-team mode, no org SSO). This does NOT let them create governed groups -- group definitions stay in personas.yaml (code). Separation of duties: this is IdP user-admin, distinct from the data-platform persona.",
+      "clientRoles": {
+        "realm-management": ["manage-users", "view-users", "query-groups"],
+        "minio": ["platform-admin"]
+      }
+    },
+    {
+      "name": "team-analytics",
+      "path": "/team-analytics",
+      "attributes": { "uc_team": ["analytics"] },
+      "realmRoles": ["team-analytics"]
+    }
+  ]
+}

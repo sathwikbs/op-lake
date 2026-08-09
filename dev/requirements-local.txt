@@ -1,0 +1,20 @@
+# Local developer kit -- run dbt and notebooks on your laptop AS YOURSELF.
+#
+# The versions here MUST match the platform:
+#   * pyspark[connect] == the Spark Connect server version (SPARK_VERSION in .env)
+#   * dbt-spark        == the adapter Dagster/dbt use in-cluster (1.10.x)
+# Mismatched pyspark connect client/server versions break the gRPC handshake.
+#
+# Setup:
+#   python3 -m venv .venv && source .venv/bin/activate
+#   pip install -r dev/requirements-local.txt
+#   eval "$(bin/uc-login)"        # authenticate as yourself (device flow)
+#   cd dbt && dbt build            # runs under YOUR Unity Catalog grants
+#
+# Local notebooks: `import uc_notebook; spark = uc_notebook.uc_session()`
+pyspark[connect]==4.1.0
+dbt-core~=1.10.0
+dbt-spark[session]~=1.10.0
+pandas
+pyarrow
+jupyterlab

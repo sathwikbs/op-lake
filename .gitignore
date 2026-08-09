@@ -1,0 +1,51 @@
+# Local environment
+.env
+
+# Unity Catalog runtime-generated auth material (created by the server on start)
+infra/unitycatalog/conf/token.txt
+infra/unitycatalog/conf/*.key
+infra/unitycatalog/conf/*.pem
+infra/unitycatalog/conf/certs/
+
+# dbt
+dbt/target/
+dbt/dbt_packages/
+dbt/logs/
+**/.user.yml
+
+# Dagster (DAGSTER_HOME is the bind-mounted ./dagster dir at runtime)
+dagster/storage/
+dagster/history/
+dagster/logs/
+dagster/compute_logs/
+dagster/schedules/
+dagster/.telemetry/
+dagster/.nux/
+**/dagster.log
+**/*.tmp
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.venv-local/
+venv/
+
+# Spark / Ivy caches (if any leak to host)
+**/.ivy2/
+**/spark-warehouse/
+**/metastore_db/
+derby.log
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+
+# IAM provisioning audit log (runtime)
+infra/iam/audit.log
+
+# JupyterHub per-user runtime workspaces (seeded at first login) + checkpoints
+infra/jupyter/notebooks/*/
+**/.ipynb_checkpoints/
+.trivy-cache/

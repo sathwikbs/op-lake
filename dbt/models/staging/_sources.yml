@@ -1,0 +1,11 @@
+version: 2
+
+# Bronze tables are produced by the Dagster PySpark ingestion asset and live in
+# the analytics.bronze schema of Unity Catalog.
+sources:
+  - name: bronze
+    schema: bronze
+    description: "Raw data landed into Delta by the Dagster ingestion step."
+    tables:
+      - name: orders
+      - name: customers

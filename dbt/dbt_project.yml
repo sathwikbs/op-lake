@@ -1,0 +1,27 @@
+name: 'dataplatform'
+version: '1.0.0'
+config-version: 2
+profile: 'dataplatform'
+
+model-paths: ["models"]
+macro-paths: ["macros"]
+target-path: "target"
+clean-targets: ["target", "dbt_packages"]
+
+# All models are UC-MANAGED Delta tables. No location_root: UC owns the storage
+# path (under storage-root.tables) and vends path-scoped credentials, and only
+# managed tables permit CREATE OR REPLACE -- which dbt-spark's `table`
+# materialization emits. (External + s3:// locations also work, but we
+# standardize on managed for uniform governance and REPLACE semantics.)
+#
+# Both planes read these tables through Spark + Unity Catalog (native Delta), so
+# no Delta->Iceberg UniForm is needed: the automation plane (Dagster/dbt) and the
+# human plane (Superset via the spark_connect_uc connector) use the same engine.
+models:
+  dataplatform:
+    +file_format: delta
+    +materialized: table
+    staging:
+      +schema: silver
+    marts:
+      +schema: gold

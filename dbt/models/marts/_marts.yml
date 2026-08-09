@@ -1,0 +1,16 @@
+version: 2
+
+models:
+  - name: customer_order_summary
+    description: "Gold mart: completed orders and revenue per customer."
+    columns:
+      - name: customer_id
+        data_tests:
+          - unique
+          - not_null
+      - name: completed_orders
+        data_tests:
+          - not_null
+      - name: total_amount
+        data_tests:
+          - not_null

@@ -1,0 +1,29 @@
+version: 2
+
+models:
+  - name: stg_orders
+    description: "Typed, cleaned orders (silver)."
+    columns:
+      - name: order_id
+        description: "Primary key."
+        data_tests:
+          - unique
+          - not_null
+      - name: customer_id
+        data_tests:
+          - not_null
+      - name: status
+        data_tests:
+          - accepted_values:
+              values: ['COMPLETED', 'PENDING', 'CANCELLED', 'REFUNDED']
+
+  - name: stg_customers
+    description: "Typed, cleaned customers (silver)."
+    columns:
+      - name: customer_id
+        data_tests:
+          - unique
+          - not_null
+      - name: email
+        data_tests:
+          - not_null

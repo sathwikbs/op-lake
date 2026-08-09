@@ -1,0 +1,21 @@
+# Dagster instance config. Run/event/schedule state is stored in Postgres so it
+# is shared between the webserver and daemon containers and survives restarts.
+telemetry:
+  enabled: false
+
+storage:
+  postgres:
+    postgres_db:
+      username:
+        env: DAGSTER_PG_USER
+      password:
+        env: DAGSTER_PG_PASSWORD
+      hostname:
+        env: DAGSTER_PG_HOST
+      db_name:
+        env: DAGSTER_PG_DB
+      port: 5432
+
+run_coordinator:
+  module: dagster.core.run_coordinator
+  class: DefaultRunCoordinator

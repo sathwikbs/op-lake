@@ -1,0 +1,30 @@
+# dbt runs against the SAME Spark Connect server as Dagster and JupyterLab
+# (Connect-first architecture). dbt-spark has no `connect` method, but the
+# stock `dbt-spark[session]` adapter opens a *remote* Spark Connect session
+# when SPARK_REMOTE is set: its session method calls
+# SparkSession.builder.getOrCreate(), and PySpark honors SPARK_REMOTE
+# (=sc://spark:15002, injected via docker-compose) to connect to the remote
+# driver. This is the approach AWS documents for dbt-core on EMR Serverless.
+#   - `host: NA` is required by dbt-core's schema but ignored when SPARK_REMOTE is set.
+#   - The remote session has the Unity Catalog 'analytics' catalog as its
+#     default catalog, so dbt uses 2-level schema.table names resolving inside it.
+#   - `enableHiveSupport()` (called by the session method) is politely refused by
+#     Spark Connect with a harmless CANNOT_MODIFY_CONFIG warning (silenced via
+#     PYTHONWARNINGS in the Dagster image); the catalog is the UC default catalog.
+dataplatform:
+  target: dev
+  outputs:
+    dev:
+      type: spark
+      method: session
+      host: NA
+      schema: silver
+      threads: 1
+      # Run as a specific Unity Catalog identity: DBT_UC_TOKEN is set by the
+      # caller (Dagster -> team service account; local `uc-login` -> the user)
+      # and bound as the per-session catalog token, so UC enforces THAT
+      # principal's grants instead of the Spark server default. If unset, the
+      # session falls back to the server default (which, post Phase 2, is the
+      # zero-grant `nobody` principal -> fail-closed).
+      server_side_parameters:
+        "spark.sql.catalog.analytics.token": "{{ env_var('DBT_UC_TOKEN', '') }}"

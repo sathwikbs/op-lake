@@ -1,0 +1,70 @@
+# ============================================================
+# Caddy TLS gateway (Phase 3 hardening) -- the single HTTPS entry point.
+#
+# Every browser UI is fronted here on :443 with a certificate signed by Caddy's
+# LOCAL internal CA (no public ACME). Subdomains route to the in-cluster service
+# by name; the internal-only ports stay unpublished. Using *.localtest.me means
+# the host browser resolves every name to 127.0.0.1 with zero /etc/hosts edits,
+# while a docker network alias makes `keycloak.localtest.me` resolve to THIS
+# gateway inside the cluster -- so Unity Catalog can fetch JWKS from the single,
+# deterministic Keycloak issuer (https://keycloak.localtest.me) over TLS.
+#
+# Trust: export Caddy's root CA once (see README) so the browser trusts these
+# certs; Unity Catalog imports it into its JVM truststore at boot.
+# ============================================================
+{
+	# All sites use Caddy's internal CA (local dev; no public certificates).
+	auto_https disable_redirects
+}
+
+(local_tls) {
+	tls internal
+}
+
+home.localtest.me {
+	import local_tls
+	# Gated: log in once at the front door (any authenticated user), then every
+	# tool SSO's silently. oauth2-proxy fronts the landing nginx.
+	reverse_proxy home-auth:4180
+}
+
+# Admin console: privileged/break-glass launchpad, gated by oauth2-proxy
+# (admin-auth) restricted to the platform-admin group. Unauthenticated visitors
+# are bounced to Keycloak; non-admins are denied. The static admin page is served
+# by a dedicated admin-landing nginx that ONLY admin-auth can reach.
+admin.localtest.me {
+	import local_tls
+	reverse_proxy admin-auth:4180
+}
+
+keycloak.localtest.me {
+	import local_tls
+	# Keycloak trusts X-Forwarded-* (KC_PROXY_HEADERS=xforwarded) and stamps its
+	# issuer from KC_HOSTNAME, so tokens carry iss=https://keycloak.localtest.me.
+	reverse_proxy keycloak:8080
+}
+
+superset.localtest.me {
+	import local_tls
+	reverse_proxy superset:8088
+}
+
+jupyter.localtest.me {
+	import local_tls
+	reverse_proxy jupyterhub:8000
+}
+
+dagster.localtest.me {
+	import local_tls
+	reverse_proxy dagster-auth:3030
+}
+
+# NOTE: the Unity Catalog OSS web UI was dropped (Option B). It required
+# client-side token exchange that isn't robust, and Superset/JupyterHub already
+# provide governed, per-user data browsing. UC catalogs/grants are administered
+# via the UC CLI / IAM reconciler. So there is no uc.localtest.me route.
+
+minio-console.localtest.me {
+	import local_tls
+	reverse_proxy minio:9001
+}

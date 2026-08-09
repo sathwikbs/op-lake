@@ -1,0 +1,45 @@
+# Rendered at container start via envsubst (see entrypoint.sh).
+spark.master                                   local[*]
+
+# --- Spark Connect (dbt + Dagster + Jupyter connect here) ---
+spark.connect.grpc.binding.port                15002
+# Compute edge auth: the server REQUIRES this pre-shared bearer token on every
+# gRPC call (native PreSharedKeyAuthenticationInterceptor). Anonymous clients are
+# rejected. Cross-container clients present it via the `spark-connect` TLS proxy;
+# host-local clients can send it over loopback (sc://localhost:15002/;token=...).
+spark.connect.authenticate.token               ${SPARK_CONNECT_TOKEN}
+
+# --- Delta Lake ---
+spark.sql.extensions                           io.delta.sql.DeltaSparkSessionExtension
+spark.sql.catalog.spark_catalog                org.apache.spark.sql.delta.catalog.DeltaCatalog
+
+# --- Unity Catalog: 'analytics' catalog is the default ---
+spark.sql.catalog.${UC_CATALOG}                io.unitycatalog.spark.UCSingleCatalog
+spark.sql.catalog.${UC_CATALOG}.uri            ${UC_URI}
+# ZERO AMBIENT IDENTITY: this default token is intentionally EMPTY. The compute
+# edge carries no UC identity of its own, so a session that does not set its own
+# per-session token is treated as nobody and denied by UC (fail-closed). Each
+# client overrides this in session conf with its principal's UC token:
+#   automation -> team service account (Dagster/dbt); human -> user (Superset/Jupyter).
+spark.sql.catalog.${UC_CATALOG}.token          ${UC_TOKEN}
+spark.sql.defaultCatalog                       ${UC_CATALOG}
+# UC is the SECRET STORE: for UC-managed table paths the connector fetches
+# short-lived, bucket-scoped credentials VENDED by UC (credential-scoped
+# filesystem, on by default in 0.5.0) and auto-renews them. There is NO static
+# object-store key here on purpose: every storage access goes through UC vending
+# per the session's principal, so a session can only touch tables it is granted
+# and a raw `s3a://...` read has NO credentials (fail-closed -> no bypass).
+spark.sql.catalog.${UC_CATALOG}.credScopedFs.enabled     true
+spark.sql.catalog.${UC_CATALOG}.renewCredential.enabled  true
+
+# --- MinIO / S3A base wiring (endpoint + path-style only; NO static creds) ---
+# credScopedFs injects the UC-vended credentials per table; these settings are
+# just the non-secret connection details it needs to reach MinIO.
+spark.hadoop.fs.s3a.endpoint                   ${S3_ENDPOINT}
+spark.hadoop.fs.s3a.path.style.access          true
+spark.hadoop.fs.s3a.connection.ssl.enabled     false
+spark.hadoop.fs.s3a.impl                       org.apache.hadoop.fs.s3a.S3AFileSystem
+spark.hadoop.fs.s3.impl                        org.apache.hadoop.fs.s3a.S3AFileSystem
+
+# Tiny local dataset -> keep shuffles small
+spark.sql.shuffle.partitions                   4

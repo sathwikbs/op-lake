@@ -1,0 +1,960 @@
+# ============================================================
+# Local, cloud-agnostic data platform. Unity Catalog is the single governance /
+# auth / RBAC authority; two compute planes route through it:
+#
+#   AUTOMATION plane (service accounts):
+#     MinIO -> Unity Catalog -> Spark Connect -> dbt, orchestrated by Dagster.
+#   HUMAN / BI plane (per-user, Keycloak SSO):
+#     Superset -> Spark Connect -> Unity Catalog. Superset exchanges each user's
+#     Keycloak token for a UC token and sets it as the per-session catalog token,
+#     so UC enforces RBAC as the LOGGED-IN USER. JupyterLab uses the same path.
+#     One engine (Spark) for both planes; UC is the single authority.
+#
+#   Bring up core stack:   docker compose up -d
+#   Add the Unity Catalog UI (optional, builds from source):
+#                          docker compose --profile ui up -d
+# ============================================================
+name: dataplatform
+
+x-common-env: &common-env
+  # Non-secret S3 addressing only. S3 KEYS are intentionally NOT here: the human/
+  # BI plane (Superset, JupyterHub) and Dagster never touch MinIO directly -- they
+  # go through Spark Connect + UC (vended creds) or mint per-identity STS creds
+  # (dlt). Only the Spark server carries a key, and it's a non-root, staging-scoped
+  # one, set explicitly on that service.
+  S3_ENDPOINT: ${S3_ENDPOINT}
+  S3_REGION: ${S3_REGION}
+  UC_URI: ${UC_URI}
+  UC_CATALOG: ${UC_CATALOG}
+
+services:
+  # ----------------------------------------------------------
+  # Vault: the platform SECRET STORE (Phase 2 hardening).
+  # File-persisted KV v2; the single source of truth for every secret. Only
+  # `vault-init` (bootstrap) and Dagster (runtime VaultSecretProvider) talk to
+  # it; all other services consume Vault-rendered env files via inject.sh.
+  # ----------------------------------------------------------
+  vault:
+    image: hashicorp/vault:1.18
+    cap_add:
+      - IPC_LOCK
+    # The image entrypoint auto-appends `-config=/vault/config`, so we only pass
+    # `server` and mount our vault.hcl into that dir (passing -config explicitly
+    # would load the listener twice -> "address already in use").
+    command: ["server"]
+    environment:
+      VAULT_ADDR: http://127.0.0.1:8200
+    volumes:
+      - ./infra/vault/vault.hcl:/vault/config/vault.hcl:ro
+      - vault_file:/vault/file
+    expose:
+      - "8200"
+    networks: [admin]   # Phase 6: secret store is admin-tier only
+    restart: unless-stopped
+
+  # One-shot: init/unseal Vault, generate strong unique secrets (idempotent),
+  # render per-service secret env files + oauth2-proxy config + the Keycloak
+  # realm (client secrets from Vault), and mint Dagster's runtime token.
+  vault-init:
+    image: hashicorp/vault:1.18
+    depends_on:
+      vault:
+        condition: service_started
+    environment:
+      VAULT_ADDR: http://vault:8200
+    entrypoint: ["/bin/sh", "/init/vault-init.sh"]
+    volumes:
+      - ./infra/vault/vault-init.sh:/init/vault-init.sh:ro
+      - ./infra/keycloak/realm-export.json:/kc-template/realm-export.json:ro
+      - vault_keys:/vault/keys
+      - secrets_render:/run/secrets-rendered
+      - kc_import:/kc-import
+    networks: [admin]   # Phase 6: talks only to Vault (admin tier)
+    restart: "no"
+
+  # ----------------------------------------------------------
+  # Caddy: TLS gateway (Phase 3 hardening) -- single HTTPS entry point for every
+  # browser UI, with a local internal CA. The `keycloak.localtest.me` network
+  # alias makes the deterministic Keycloak issuer resolve to this gateway
+  # in-cluster (so UC fetches JWKS over TLS), while the host resolves all
+  # *.localtest.me names to 127.0.0.1 automatically.
+  # ----------------------------------------------------------
+  caddy:
+    image: caddy:2.8-alpine
+    depends_on:
+      keycloak:
+        condition: service_started
+    volumes:
+      - ./infra/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    ports:
+      - "80:80"
+      - "443:443"
+    networks:
+      # On both app + data so the keycloak.localtest.me alias (the deterministic
+      # issuer) resolves to the gateway for BOTH app services and the data-tier
+      # UC/MinIO that fetch JWKS over TLS.
+      default:
+        aliases:
+          - keycloak.localtest.me
+      data:
+        aliases:
+          - keycloak.localtest.me
+    restart: unless-stopped
+
+  # ----------------------------------------------------------
+  # Postgres: metadata backend for Unity Catalog + Dagster storage
+  # ----------------------------------------------------------
+  postgres:
+    image: postgres:${POSTGRES_VERSION}
+    depends_on:
+      vault-init:
+        condition: service_completed_successfully
+    # inject.sh sources POSTGRES_PASSWORD from Vault before the real entrypoint.
+    entrypoint: ["/bin/sh", "/secrets/inject.sh", "docker-entrypoint.sh"]
+    command: ["postgres"]
+    environment:
+      SECRETS_FILE: postgres
+      POSTGRES_USER: ${POSTGRES_USER}
+      UC_DB: ${UC_DB}
+      DAGSTER_DB: ${DAGSTER_DB}
+      SUPERSET_DB: ${SUPERSET_DB}
+      KEYCLOAK_DB: ${KEYCLOAK_DB}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./infra/postgres/init:/docker-entrypoint-initdb.d:ro
+      - ./infra/secrets/inject.sh:/secrets/inject.sh:ro
+      - secrets_render:/run/secrets-rendered:ro
+    # Internal-only (Phase 1 hardening): no host port. Reachable in-cluster as
+    # postgres:5432 by UC / Dagster / Superset / Keycloak.
+    expose:
+      - "5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ----------------------------------------------------------
+  # MinIO: S3-compatible object storage (the "storage abstraction")
+  # ----------------------------------------------------------
+  minio:
+    image: minio/minio:${MINIO_VERSION}
+    # inject.sh sources MINIO_ROOT_* + the OIDC client secret from Vault, then
+    # runs the stock MinIO entrypoint with the server command.
+    entrypoint: ["/bin/sh", "/secrets/inject.sh", "/usr/bin/docker-entrypoint.sh"]
+    command: ["server", "/data", "--console-address", ":9001"]
+    depends_on:
+      keycloak:
+        condition: service_started
+      vault-init:
+        condition: service_completed_successfully
+      # Phase 3: gateway must be up so its local CA root exists; inject.sh installs
+      # it into MinIO's trust dir so MinIO's OIDC client trusts the
+      # https://keycloak.localtest.me issuer when fetching JWKS.
+      caddy:
+        condition: service_started
+    environment:
+      SECRETS_FILE: minio
+      # Install Caddy's local CA (from the caddy_data mount) into MinIO's CAs dir
+      # before startup, so MinIO trusts the gateway TLS for OIDC/JWKS.
+      EXTRA_CA_SRC: /caddy-data/caddy/pki/authorities/local/root.crt
+      EXTRA_CA_DEST: /root/.minio/certs/CAs/caddy-local-ca.crt
+      # Console is fronted by the Caddy gateway; tell MinIO its EXTERNAL console
+      # URL so the OIDC callback uses https://minio-console.localtest.me/oauth_callback
+      # (which matches the `minio` client's registered redirectUris) instead of the
+      # container's internal IP:port -> fixes "Invalid parameter: redirect_uri".
+      MINIO_BROWSER_REDIRECT_URL: https://minio-console.localtest.me
+      # --- Keycloak OIDC: govern MinIO by identity (STS AssumeRoleWithWebIdentity) ---
+      # MinIO validates Keycloak JWTs against this provider and reads the
+      # `minio_policy` claim to attach hierarchical bucket/path policies. Callers
+      # (dlt, humans) exchange their Keycloak token for short-lived, path-scoped
+      # S3 creds -- root is never handed out. Provider is reachable in-cluster at
+      # keycloak:8080 (matches the `iss` of M2M/client-credentials tokens).
+      MINIO_IDENTITY_OPENID_CONFIG_URL: http://keycloak:8080/realms/${KC_REALM}/.well-known/openid-configuration
+      MINIO_IDENTITY_OPENID_CLIENT_ID: ${MINIO_OIDC_CLIENT_ID}
+      # MINIO_IDENTITY_OPENID_CLIENT_SECRET + MINIO_ROOT_* come from Vault via inject.sh.
+      MINIO_IDENTITY_OPENID_CLAIM_NAME: ${MINIO_OIDC_CLAIM_NAME}
+      MINIO_IDENTITY_OPENID_SCOPES: "openid"
+      MINIO_IDENTITY_OPENID_DISPLAY_NAME: "Keycloak"
+    volumes:
+      - minio_data:/data
+      - ./infra/secrets/inject.sh:/secrets/inject.sh:ro
+      - secrets_render:/run/secrets-rendered:ro
+      # Caddy's local CA root (read-only); inject.sh copies it into MinIO's CAs dir.
+      - caddy_data:/caddy-data:ro
+    networks: [data]   # Phase 6: storage tier only; app services can't reach MinIO
+    # Internal-only. S3 API (9000) for UC vending / STS callers; the browser
+    # console (9001) is now fronted by the Caddy gateway (minio-console.localtest.me).
+    expose:
+      - "9000"
+      - "9001"
+
+  # Creates the lakehouse bucket and uploads sample raw CSVs (runs once).
+  # It waits for MinIO to accept connections itself (see create-buckets.sh),
+  # so MinIO needs no container healthcheck.
+  minio-init:
+    image: minio/mc:${MC_VERSION}
+    depends_on:
+      minio:
+        condition: service_started
+      vault-init:
+        condition: service_completed_successfully
+    environment:
+      SECRETS_FILE: minio-init      # MINIO_ROOT_* sourced from Vault via inject.sh
+      LAKEHOUSE_BUCKET: ${LAKEHOUSE_BUCKET}
+      # Permanent, bucket-scoped storage service account for Unity Catalog to
+      # vend. Non-expiring => UC never needs a restart to keep storage creds live.
+      UC_STORAGE_ACCESS_KEY: ${UC_STORAGE_ACCESS_KEY}
+      UC_STORAGE_SECRET_KEY: ${UC_STORAGE_SECRET_KEY}
+    entrypoint: ["/bin/sh", "/secrets/inject.sh", "/bin/sh", "/scripts/create-buckets.sh"]
+    networks: [data]   # Phase 6: storage tier
+    volumes:
+      - ./infra/minio/init:/scripts:ro
+      - ./data:/data:ro
+      - ./infra/secrets/inject.sh:/secrets/inject.sh:ro
+      - secrets_render:/run/secrets-rendered:ro
+    restart: "no"
+
+  # ----------------------------------------------------------
+  # Keycloak: OIDC identity provider (auth for UC server + UI)
+  # ----------------------------------------------------------
+  keycloak:
+    image: quay.io/keycloak/keycloak:${KEYCLOAK_VERSION}
+    # inject.sh sources KC_BOOTSTRAP_ADMIN_PASSWORD + KC_DB_PASSWORD from Vault.
+    entrypoint: ["/bin/sh", "/secrets/inject.sh", "/opt/keycloak/bin/kc.sh"]
+    command: ["start-dev", "--import-realm", "--http-port=8080"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      vault-init:
+        condition: service_completed_successfully
+    environment:
+      SECRETS_FILE: keycloak
+      KC_BOOTSTRAP_ADMIN_USERNAME: ${KEYCLOAK_ADMIN}
+      KC_HOSTNAME_STRICT: "false"
+      KC_HTTP_ENABLED: "true"
+      # Phase 3: single deterministic frontend issuer behind the Caddy gateway.
+      # Every token (browser AND backchannel on :8080) now carries
+      # iss=https://keycloak.localtest.me, so UC/oauth2-proxy validate one issuer.
+      KC_HOSTNAME: ${KEYCLOAK_BROWSER_BASE}
+      KC_PROXY_HEADERS: xforwarded
+      # Durable identity store: users, roles, groups and RUNTIME membership live
+      # in the shared Postgres, so they survive container recreate / image
+      # upgrades (not just crashes) -- unlike ephemeral dev H2 in the writable
+      # layer. `--import-realm` uses IGNORE_EXISTING: it SEEDS realm-export.json
+      # on an empty DB and then leaves the persisted realm alone on later starts
+      # (so runtime changes are preserved). To re-seed after editing the realm
+      # file, drop the keycloak DB (or the realm) first.
+      KC_DB: postgres
+      KC_DB_URL_HOST: postgres
+      KC_DB_URL_DATABASE: ${KEYCLOAK_DB}
+      KC_DB_USERNAME: ${POSTGRES_USER}
+      KC_DB_SCHEMA: public
+    volumes:
+      # Realm imported from the Vault-rendered copy (client secrets substituted),
+      # written by vault-init into the kc_import volume.
+      - kc_import:/opt/keycloak/data/import:ro
+      - ./infra/secrets/inject.sh:/secrets/inject.sh:ro
+      - secrets_render:/run/secrets-rendered:ro
+    networks: [default, data]   # Phase 6: app (SSO) + data (MinIO/UC issuer)
+    # Phase 3: internal-only. Browser access is via the Caddy gateway at
+    # https://keycloak.localtest.me; in-cluster callers use keycloak:8080
+    # (backchannel) or the keycloak.localtest.me alias (issuer/JWKS).
+    expose:
+      - "8080"
+
+  # ----------------------------------------------------------
+  # Unity Catalog: governance / catalog / RBAC / secret store.
+  #
+  # MINT-ON-START: UC reads its storage credential only at boot and vends that
+  # session for the life of the process (verified: no hot-reload of
+  # server.properties). So this image (see infra/unitycatalog/Dockerfile) wraps
+  # the entrypoint to mint a FRESH bucket-scoped MinIO STS session as the first
+  # step of EVERY (re)start -- including crash-triggered restarts -- then exec
+  # the server. UC therefore never comes up holding an expired token, and a
+  # restart is self-healing. This folds in (and replaces) the old one-shot
+  # `uc-rotate` seeder; the MinIO parent credential now lives only inside UC's
+  # start wrapper (scrubbed from the long-running server env), mirroring cloud
+  # where UC self-vends via its instance role.
+  #
+  # UC writes its admin token.txt + signing keys into the shared uc_conf volume,
+  # shared read-only with the bootstrap, Spark, and Dagster containers.
+  # ----------------------------------------------------------
+  unitycatalog:
+    build:
+      context: ./infra/unitycatalog
+      dockerfile: Dockerfile
+      args:
+        UC_VERSION: ${UC_VERSION}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      keycloak:
+        condition: service_started
+      minio:
+        condition: service_started
+      minio-init:
+        condition: service_completed_successfully
+      vault-init:
+        condition: service_completed_successfully
+      # Phase 3: gateway must be up so its local CA root exists for UC to trust
+      # (UC fetches JWKS from the https://keycloak.localtest.me issuer via Caddy).
+      caddy:
+        condition: service_started
+    environment:
+      # PERMANENT bucket-scoped MinIO service-account key (created by minio-init).
+      # When set, UC installs it as its storage credential with NO session token:
+      # it never expires, so UC never needs a restart/rotation to keep creds
+      # valid (the failure-free posture). Scrubbed from the server env after use.
+      # Leave these UNSET to fall back to STS mint-on-start instead.
+      UC_STORAGE_ACCESS_KEY: ${UC_STORAGE_ACCESS_KEY}
+      UC_STORAGE_SECRET_KEY: ${UC_STORAGE_SECRET_KEY}
+      # MinIO parent credential + STS knobs: used ONLY by the STS mint-on-start
+      # fallback (when UC_STORAGE_ACCESS_KEY is unset). Scrubbed before start.
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      S3_ENDPOINT: ${S3_ENDPOINT}
+      S3_REGION: ${S3_REGION}
+      LAKEHOUSE_BUCKET: ${LAKEHOUSE_BUCKET}
+      STS_DURATION_SECONDS: ${STS_DURATION_SECONDS:-604800}
+      UC_CONF_DIR: /home/unitycatalog/etc/conf
+      UC_TEMPLATE: /template/server.properties
+    volumes:
+      - uc_conf:/home/unitycatalog/etc/conf
+      - uc_data:/home/unitycatalog/etc/data
+      - ./infra/unitycatalog/conf:/template:ro
+      # uc-entrypoint.sh sources unitycatalog.env (MinIO parent creds + OIDC
+      # client secret) from Vault's render volume at boot.
+      - secrets_render:/run/secrets-rendered:ro
+      # Caddy's local CA root (read-only), imported into UC's JVM truststore so
+      # it trusts the https://keycloak.localtest.me issuer for JWKS validation.
+      - caddy_data:/caddy-data:ro
+    networks: [default, data]   # Phase 6: app (token exchange) + data (MinIO)
+    # Internal-only (Phase 1 hardening): the UC metastore API is reachable
+    # in-cluster as unitycatalog:8080 (Spark connector, token exchange, bootstrap,
+    # reconciler). Host access to the API/UI comes via the Phase 3 TLS gateway.
+    expose:
+      - "8080"
+    # Self-heal on crash; each restart re-mints a fresh session via the wrapper.
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8080"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+  # (Phase 3) The uc-kc-jwks-bridge socat split-horizon hack was REMOVED. With
+  # the Caddy gateway, Keycloak has a single deterministic issuer
+  # (https://keycloak.localtest.me via KC_HOSTNAME); the `keycloak.localtest.me`
+  # docker alias points in-cluster callers (Unity Catalog) at the gateway, so UC
+  # fetches JWKS from the one issuer over TLS -- no split-horizon forwarding.
+
+  # Bootstraps catalog/schemas + users + RBAC grants (runs once, then exits).
+  uc-bootstrap:
+    image: unitycatalog/unitycatalog:${UC_VERSION}
+    depends_on:
+      unitycatalog:
+        condition: service_healthy
+    environment:
+      UC_URI: http://unitycatalog:8080
+      UC_CATALOG: ${UC_CATALOG}
+    entrypoint: ["/bin/bash", "/bootstrap/bootstrap.sh"]
+    volumes:
+      - uc_conf:/home/unitycatalog/etc/conf:ro
+      - ./infra/unitycatalog/bootstrap:/bootstrap:ro
+    restart: "no"
+
+  # Optional web UI (build from source). Enable with:  --profile ui
+  # ----------------------------------------------------------
+  # Spark: compute engine exposing a Spark Connect server (:15002)
+  # Pre-wired with Delta + Unity Catalog + S3A(MinIO).
+  # ----------------------------------------------------------
+  spark:
+    build:
+      context: ./infra/spark
+      args:
+        SPARK_VERSION: ${SPARK_VERSION}
+        SCALA_VERSION: ${SCALA_VERSION}
+        SPARK_MAJOR_MINOR: ${SPARK_MAJOR_MINOR}
+        DELTA_VERSION: ${DELTA_VERSION}
+        UC_SPARK_VERSION: ${UC_SPARK_VERSION}
+        HADOOP_AWS_VERSION: ${HADOOP_AWS_VERSION}
+    depends_on:
+      unitycatalog:
+        condition: service_healthy
+      uc-bootstrap:
+        condition: service_completed_successfully
+      minio-init:
+        condition: service_completed_successfully
+      vault-init:
+        condition: service_completed_successfully
+    # inject.sh sources SPARK_CONNECT_TOKEN from Vault, then the Spark entrypoint.
+    entrypoint: ["/bin/sh", "/secrets/inject.sh", "/opt/entrypoint.sh"]
+    environment:
+      <<: *common-env
+      SECRETS_FILE: spark
+      # NO static object-store key: all storage access is UC-vended per session
+      # (credScopedFs). A raw s3a:// read has no credentials -> fail-closed, no
+      # bypass. Ingestion writes managed tables via the UC connector (dlt ->
+      # Spark Connect), so nothing needs a direct MinIO key here.
+      SPARK_MAJOR_MINOR: ${SPARK_MAJOR_MINOR}
+      SCALA_VERSION: ${SCALA_VERSION}
+      DELTA_VERSION: ${DELTA_VERSION}
+      UC_SPARK_VERSION: ${UC_SPARK_VERSION}
+      HADOOP_AWS_VERSION: ${HADOOP_AWS_VERSION}
+      # SPARK_CONNECT_TOKEN (pre-shared bearer for every RPC) is sourced from Vault.
+    volumes:
+      # read the UC admin token generated by the server (shared conf volume)
+      - uc_conf:/opt/uc-conf:ro
+      - ivy_cache:/opt/spark/.ivy2
+      - ./infra/secrets/inject.sh:/secrets/inject.sh:ro
+      - secrets_render:/run/secrets-rendered:ro
+    networks: [data]   # Phase 6: storage/compute tier (not reachable by app UIs)
+    # Internal-only (Phase 1 hardening): raw Spark Connect (15002, no TLS) and the
+    # Spark UI (4040) are never published. Clients reach Spark Connect ONLY via the
+    # TLS + token proxy `spark-connect:15003`.
+    expose:
+      - "15002"
+      - "4040"
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/15002"]
+      interval: 10s
+      timeout: 5s
+      retries: 60
+      start_period: 60s
+
+  # ----------------------------------------------------------
+  # connect-tls-init: mints the self-signed cert for the Spark Connect proxy
+  # into the shared `connect_tls` volume (runs once, idempotent).
+  # ----------------------------------------------------------
+  connect-tls-init:
+    image: alpine:3.20
+    entrypoint: ["/bin/sh", "/gen/gen-cert.sh"]
+    environment:
+      CERT_DIR: /certs
+    volumes:
+      - connect_tls:/certs
+      - ./infra/spark-connect-proxy:/gen:ro
+    restart: "no"
+
+  # ----------------------------------------------------------
+  # spark-connect: TLS-terminating gRPC proxy in front of Spark Connect.
+  # Lets cross-container clients present the pre-shared token (PySpark requires
+  # TLS for token auth to a non-localhost host). Forwards to spark:15002, where
+  # the token is validated natively. Extend here for per-user OIDC/JWKS.
+  # ----------------------------------------------------------
+  spark-connect:
+    image: nginx:1.27-alpine
+    depends_on:
+      spark:
+        condition: service_healthy
+      connect-tls-init:
+        condition: service_completed_successfully
+    volumes:
+      - ./infra/spark-connect-proxy/nginx.conf:/etc/nginx/nginx.conf:ro
+      - connect_tls:/certs:ro
+    networks: [default, data]   # Phase 6: app clients (incl. Dagster) -> proxy -> spark (data)
+    ports:
+      - "15003:15003"  # Spark Connect (TLS + token)
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 15003 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+
+  # ----------------------------------------------------------
+  # Dagster: orchestration (dbt assets + PySpark bronze ingestion)
+  # ----------------------------------------------------------
+  dagster-webserver:
+    build:
+      context: ./infra/dagster
+    # serve.py = stock dagster-webserver + a server-side middleware that stamps
+    # each UI-launched run with the authenticated launcher's identity (from the
+    # oauth2-proxy X-Auth-Request-* headers), so uc_identity.authorize_team_run
+    # can enforce team scoping fail-closed. See dagster/serve.py.
+    entrypoint: ["/bin/sh", "/secrets/inject.sh", "/opt/entrypoint.sh"]
+    command: ["python", "/opt/dagster/app/serve.py", "-h", "0.0.0.0", "-p", "3030", "-w", "/opt/dagster/app/workspace.yaml"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      spark-connect:
+        condition: service_healthy
+      vault-init:
+        condition: service_completed_successfully
+    environment: &dagster-env
+      <<: *common-env
+      # dbt-spark session method calls enableHiveSupport(), which Spark Connect
+      # refuses with a harmless CANNOT_MODIFY_CONFIG warning -- silence it.
+      PYTHONWARNINGS: ignore
+      DAGSTER_HOME: /opt/dagster/app
+      DAGSTER_PG_HOST: postgres
+      DAGSTER_PG_DB: ${DAGSTER_DB}
+      DAGSTER_PG_USER: ${POSTGRES_USER}
+      # inject.sh sources DAGSTER_PG_PASSWORD + SPARK_CONNECT_TOKEN + VAULT_ADDR/
+      # VAULT_TOKEN from Vault, and builds SPARK_REMOTE from the token.
+      SECRETS_FILE: dagster
+      NEEDS_SPARK_REMOTE: "1"
+      GRPC_DEFAULT_SSL_ROOTS_FILE_PATH: /certs/server.crt
+      # Automation identity: every Dagster run authenticates as this team SERVICE
+      # ACCOUNT and gets a Unity Catalog token (client-credentials -> UC exchange),
+      # bound as the per-session catalog token. UC enforces the SA's grants, never
+      # admin. SA client SECRETS are fetched from Vault at runtime by
+      # VaultSecretProvider (uc_identity.py) -- never present in this env.
+      UC_AUTOMATION_SA_CLIENT_ID: ${UC_AUTOMATION_SA_CLIENT_ID}
+      # Team-scoped SAs (Phase 6): a job tagged `team: <name>` runs as that team's
+      # SA by CONVENTION `sa-team-<name>` (auto-provisioned by the IAM reconciler;
+      # its secret is read from Vault at secret/platform/sa/<client_id>). No
+      # team->SA env map to maintain.
+      LAKEHOUSE_BUCKET: ${LAKEHOUSE_BUCKET}
+      DBT_PROFILES_DIR: /opt/dagster/app/dbt
+      DBT_PROJECT_DIR: /opt/dagster/app/dbt
+      # dlt ingestion writes UC-MANAGED Delta tables via Spark Connect
+      # (data_platform.uc_managed_destination) -- storage creds are UC-vended,
+      # per session. There is no dlt filesystem destination and no direct MinIO
+      # access from Dagster (the old minio_sts web-identity path was removed;
+      # MinIO is admin-only and network-isolated from this tier).
+    volumes:
+      - ./dagster:/opt/dagster/app
+      - ./dbt:/opt/dagster/app/dbt
+      - ./data:/opt/dagster/app/data:ro
+      - connect_tls:/certs:ro
+      - ./infra/secrets/inject.sh:/secrets/inject.sh:ro
+      - secrets_render:/run/secrets-rendered:ro
+    # No host port: the Dagster UI is only reachable through the Keycloak-gated
+    # oauth2-proxy (`dagster-auth`), which publishes :3030. Dagster OSS has no
+    # built-in auth, so the proxy is the access-control boundary.
+    expose:
+      - "3030"
+    networks: [default, admin]   # Phase 6: app tier + admin (reads Vault at runtime)
+
+  dagster-daemon:
+    build:
+      context: ./infra/dagster
+    entrypoint: ["/bin/sh", "/secrets/inject.sh", "/opt/entrypoint.sh"]
+    command: ["dagster-daemon", "run"]
+    networks: [default, admin]   # Phase 6: app tier + admin (reads Vault at runtime)
+    depends_on:
+      postgres:
+        condition: service_healthy
+      spark-connect:
+        condition: service_healthy
+      vault-init:
+        condition: service_completed_successfully
+    environment: *dagster-env
+    volumes:
+      - ./dagster:/opt/dagster/app
+      - ./dbt:/opt/dagster/app/dbt
+      - ./data:/opt/dagster/app/data:ro
+      - connect_tls:/certs:ro
+      - ./infra/secrets/inject.sh:/secrets/inject.sh:ro
+      - secrets_render:/run/secrets-rendered:ro
+
+  # ----------------------------------------------------------
+  # Superset: dashboards on the HUMAN plane.
+  #   user --Keycloak SSO--> Superset --(exchange KC token -> UC token, set as
+  #   per-session Spark catalog token)--> Spark Connect --> Unity Catalog RBAC.
+  # No service account behind dashboards: every query carries the viewer's
+  # identity, so a user sees only what UC granted them. Same Spark engine as the
+  # automation plane; the custom `spark_connect_uc` engine-spec/dialect does the
+  # per-user token exchange (see infra/superset/spark_connect_uc/).
+  # ----------------------------------------------------------
+  superset:
+    build:
+      context: ./infra/superset
+      args:
+        SUPERSET_VERSION: ${SUPERSET_VERSION}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      spark-connect:
+        condition: service_healthy
+      unitycatalog:
+        condition: service_healthy
+      keycloak:
+        condition: service_started
+      vault-init:
+        condition: service_completed_successfully
+    environment:
+      <<: *common-env
+      # inject.sh sources SUPERSET_SECRET_KEY, SUPERSET_ADMIN_PASSWORD,
+      # POSTGRES_PASSWORD, SUPERSET_OIDC_CLIENT_SECRET + SPARK_CONNECT_TOKEN from
+      # Vault, and builds SPARK_REMOTE from the token.
+      SECRETS_FILE: superset
+      NEEDS_SPARK_REMOTE: "1"
+      SUPERSET_ADMIN: ${SUPERSET_ADMIN}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_HOST: postgres
+      SUPERSET_DB: ${SUPERSET_DB}
+      # Keycloak SSO (browser dance) + internal base for the UC token exchange.
+      KEYCLOAK_REALM: ${KC_REALM}
+      KEYCLOAK_BROWSER_BASE: ${KEYCLOAK_BROWSER_BASE}
+      KEYCLOAK_INTERNAL_BASE: http://keycloak:8080
+      SUPERSET_OIDC_CLIENT_ID: ${SUPERSET_OIDC_CLIENT_ID}
+      SUPERSET_PUBLIC_BASE: ${SUPERSET_PUBLIC_BASE}
+      # Spark Connect edge (same TLS proxy + pre-shared token as Dagster/Jupyter).
+      # The per-user UC token is layered on top per session by the engine-spec.
+      GRPC_DEFAULT_SSL_ROOTS_FILE_PATH: /certs/server.crt
+    volumes:
+      - ./infra/superset/superset_config.py:/app/pythonpath/superset_config.py:ro
+      - ./infra/superset/bootstrap.sh:/app/docker/bootstrap.sh:ro
+      - ./infra/superset/register_spark.py:/app/docker/register_spark.py:ro
+      - ./infra/superset/spark_connect_uc:/app/pythonpath/spark_connect_uc:ro
+      - connect_tls:/certs:ro
+      - ./infra/secrets/inject.sh:/secrets/inject.sh:ro
+      - secrets_render:/run/secrets-rendered:ro
+    # Phase 3: internal-only; browser access via the gateway (superset.localtest.me).
+    expose:
+      - "8088"
+    entrypoint: ["/bin/sh", "/secrets/inject.sh", "/bin/bash", "/app/docker/bootstrap.sh"]
+
+  # ----------------------------------------------------------
+  # JupyterHub: multi-user, Keycloak-SSO'd interactive dev (human/BI plane).
+  # Each user logs in via Keycloak; the spawner injects THEIR Keycloak token and
+  # uc_notebook.uc_session() exchanges it for a Unity Catalog token, so Spark
+  # Connect runs as that user and UC enforces RBAC per person. No admin default
+  # (the compute edge holds zero ambient identity) -- identical trust model to
+  # Superset, same Spark engine as dbt & Dagster.
+  # ----------------------------------------------------------
+  jupyterhub:
+    build:
+      context: ./infra/jupyter
+      args:
+        PYSPARK_VERSION: ${SPARK_VERSION}
+    depends_on:
+      spark-connect:
+        condition: service_healthy
+      unitycatalog:
+        condition: service_healthy
+      keycloak:
+        condition: service_started
+      vault-init:
+        condition: service_completed_successfully
+    # inject.sh sources OIDC_CLIENT_SECRET, JUPYTERHUB_CRYPT_KEY +
+    # SPARK_CONNECT_TOKEN from Vault, builds SPARK_REMOTE, then runs JupyterHub.
+    entrypoint: ["/bin/sh", "/secrets/inject.sh", "jupyterhub", "-f", "/srv/jupyterhub/jupyterhub_config.py"]
+    environment:
+      <<: *common-env
+      SECRETS_FILE: jupyterhub
+      NEEDS_SPARK_REMOTE: "1"
+      GRPC_DEFAULT_SSL_ROOTS_FILE_PATH: /certs/server.crt
+      LAKEHOUSE_BUCKET: ${LAKEHOUSE_BUCKET}
+      # Keycloak SSO: browser authorize via the gateway (KEYCLOAK_BROWSER_BASE =
+      # https://keycloak.localtest.me); backchannel token/userinfo internal (keycloak:8080).
+      KEYCLOAK_REALM: ${KC_REALM}
+      KEYCLOAK_BROWSER_BASE: ${KEYCLOAK_BROWSER_BASE}
+      KEYCLOAK_INTERNAL_BASE: http://keycloak:8080
+      OIDC_CLIENT_ID: ${JUPYTERHUB_OIDC_CLIENT_ID}
+      JUPYTERHUB_PUBLIC_BASE: ${JUPYTERHUB_PUBLIC_BASE}
+      # Where notebooks exchange KC->UC tokens.
+      UC_EXCHANGE_URL: http://unitycatalog:8080/api/1.0/unity-control/auth/tokens
+    # Phase 3: internal-only; browser access via the gateway (jupyter.localtest.me).
+    expose:
+      - "8000"
+    volumes:
+      - ./infra/jupyter/jupyterhub_config.py:/srv/jupyterhub/jupyterhub_config.py:ro
+      - ./infra/jupyter/uc_notebook.py:/opt/nbtools/uc_notebook.py:ro
+      - ./infra/jupyter/notebooks:/home/dev/notebooks
+      - connect_tls:/certs:ro
+      - ./infra/secrets/inject.sh:/secrets/inject.sh:ro
+      - secrets_render:/run/secrets-rendered:ro
+
+  # ----------------------------------------------------------
+  # oauth2-proxy: Keycloak SSO + role-based access in front of the Dagster UI.
+  # Dagster OSS ships no auth, so this proxy IS the access boundary. Only members
+  # whose persona carries the right realm role (data-engineer / platform-admin,
+  # surfaced as a `groups` claim) may reach the orchestration UI; analysts are
+  # denied. Keycloak via the gateway: browser authorizes at the single issuer
+  # https://keycloak.localtest.me; token redeem/JWKS over the internal network
+  # (keycloak:8080).
+  # ----------------------------------------------------------
+  dagster-auth:
+    image: quay.io/oauth2-proxy/oauth2-proxy:v7.7.1
+    depends_on:
+      dagster-webserver:
+        condition: service_started
+      keycloak:
+        condition: service_started
+      vault-init:
+        condition: service_completed_successfully
+    # oauth2-proxy is a distroless image (no shell for an inject.sh shim), so its
+    # client_secret + cookie_secret are read from a Vault-rendered --config file
+    # instead of the command line -- no secret is passed as a flag or from .env.
+    command:
+      - --config=/run/secrets-rendered/oauth2-proxy.cfg
+      - --http-address=0.0.0.0:3030
+      - --upstream=http://dagster-webserver:3030
+      - --provider=oidc
+      - --skip-oidc-discovery=true
+      - --oidc-issuer-url=${KEYCLOAK_BROWSER_BASE}/realms/${KC_REALM}
+      - --login-url=${KEYCLOAK_BROWSER_BASE}/realms/${KC_REALM}/protocol/openid-connect/auth
+      - --redeem-url=http://keycloak:8080/realms/${KC_REALM}/protocol/openid-connect/token
+      - --oidc-jwks-url=http://keycloak:8080/realms/${KC_REALM}/protocol/openid-connect/certs
+      # Tokens carry iss=https://keycloak.localtest.me but are redeemed over the
+      # internal host (keycloak:8080); don't hard-fail on the issuer host mismatch.
+      - --insecure-oidc-skip-issuer-verification=true
+      - --client-id=dagster
+      - --redirect-url=${DAGSTER_PUBLIC_BASE}/oauth2/callback
+      # Behind the Caddy TLS gateway: trust its X-Forwarded-Proto and force
+      # Secure cookies (consistent with the admin-auth gate).
+      - --reverse-proxy=true
+      - --cookie-secure=true
+      - --skip-provider-button=true
+      - --email-domain=*
+      - --scope=openid email profile
+      # Persona-based access: realm roles are surfaced as the `groups` claim on
+      # the dagster client; only these personas may use the orchestration UI.
+      - --oidc-groups-claim=groups
+      - --allowed-group=data-engineer
+      - --allowed-group=platform-admin
+      - --pass-access-token=true
+      - --set-xauthrequest=true
+    volumes:
+      - secrets_render:/run/secrets-rendered:ro
+    # Phase 3: internal-only; browser access via the gateway (dagster.localtest.me).
+    expose:
+      - "3030"
+
+  # ----------------------------------------------------------
+  # IAM reconciler: governance-plane sidecar (NOT in Dagster). Reconciles
+  # Keycloak group membership -> per-principal Unity Catalog grants on a cron
+  # interval (and on demand for event-based triggers). Co-located with UC so it
+  # calls bin/uc with the admin token directly; this is the ONLY automation
+  # component that holds the UC admin credential, keeping least-privilege.
+  # ----------------------------------------------------------
+  iam-reconciler:
+    build:
+      context: ./infra/iam
+      args:
+        UC_VERSION: ${UC_VERSION}
+    depends_on:
+      unitycatalog:
+        condition: service_healthy
+      keycloak:
+        condition: service_started
+      vault-init:
+        condition: service_completed_successfully
+    user: "0:0"  # write state/ + audit.log into the mounted host dir
+    # inject.sh sources KEYCLOAK_ADMIN_PASSWORD from Vault before the reconciler.
+    entrypoint: ["/bin/sh", "/secrets/inject.sh", "/bin/sh", "/iam/reconciler-entrypoint.sh"]
+    environment:
+      SECRETS_FILE: reconciler
+      # Admin token comes from the shared uc_conf volume (read-only).
+      UC_TOKEN_FILE: etc/conf/token.txt
+      UC_HOME: /home/unitycatalog
+      UC_RECONCILER_INPLACE: "1"
+      UC_URI: ${UC_URI}
+      # Talk to Keycloak over the internal network (not the browser port).
+      KC_BASE: http://keycloak:8080
+      KC_REALM: ${KC_REALM}
+      KEYCLOAK_ADMIN: ${KEYCLOAK_ADMIN}
+      UC_CATALOG: ${UC_CATALOG}
+      RECONCILE_INTERVAL_SECONDS: ${RECONCILE_INTERVAL_SECONDS:-60}
+    volumes:
+      - uc_conf:/home/unitycatalog/etc/conf:ro
+      - ./infra/iam:/iam
+      - ./infra/secrets/inject.sh:/secrets/inject.sh:ro
+      - secrets_render:/run/secrets-rendered:ro
+    # default = reach UC + Keycloak (app tier); admin = reach Vault to store
+    # auto-provisioned SA secrets (the reconciler is itself an admin-tier component).
+    networks: [default, admin]
+    restart: unless-stopped
+
+  # ----------------------------------------------------------
+  # Admin-plane UC credential refresher (scheduled, self-minting restart).
+  #
+  # UC loads its MinIO storage credential ONLY at boot and vends it unchanged for
+  # the life of the process (no hot-reload; no working runtime reload API; a
+  # permanent key is refused for vending). Our custom UC image mints a FRESH
+  # bucket-scoped STS session on EVERY start, so a restart == a fresh credential.
+  # This sidecar triggers that restart on a schedule comfortably inside the STS
+  # TTL, so the vended session is always young and never expires under a running
+  # workload. It holds the Docker socket (root-equivalent) purely to issue the
+  # restart -> keep it admin-only; no ports, single purpose. For prod, front it
+  # with a docker-socket-proxy limited to POST /containers/*/restart.
+  # ----------------------------------------------------------
+  # ----------------------------------------------------------
+  # docker-socket-proxy (Phase 4 hardening): the ONLY container that touches the
+  # host Docker socket. It exposes a filtered Docker API over TCP and permits
+  # exactly what uc-cred-refresher needs -- list containers (CONTAINERS), read
+  # version/ping, and POST /containers/{id}/restart (ALLOW_RESTARTS) -- and
+  # DENIES everything else (create/exec/stop/rm, images, volumes, networks...).
+  # This shrinks the refresher's root-equivalent blast radius to "restart only".
+  # ----------------------------------------------------------
+  docker-socket-proxy:
+    image: nginx:1.27-alpine
+    # Custom nginx whitelist (see infra/docker-proxy/nginx.conf): permits only
+    # GET /_ping, /version, /containers/json and POST /containers/{id}/restart;
+    # everything else -> 403. Tighter + version-independent vs the generic proxy.
+    volumes:
+      - ./infra/docker-proxy/nginx.conf:/etc/nginx/nginx.conf:ro
+      # Read-only host Docker socket -- confined to this admin-plane proxy.
+      - ${DOCKER_SOCK:-/var/run/docker.sock}:/var/run/docker.sock:ro
+    expose:
+      - "2375"
+    networks: [admin]   # Phase 6: only reachable by uc-cred-refresher
+    restart: unless-stopped
+
+  uc-cred-refresher:
+    image: docker:27-cli
+    depends_on:
+      unitycatalog:
+        condition: service_healthy
+      docker-socket-proxy:
+        condition: service_started
+    environment:
+      # MUST be < STS_DURATION_SECONDS. Default 6 days vs the 7-day STS TTL.
+      UC_REFRESH_INTERVAL_SECONDS: ${UC_REFRESH_INTERVAL_SECONDS:-518400}
+      STS_DURATION_SECONDS: ${STS_DURATION_SECONDS:-604800}
+      COMPOSE_PROJECT: ${COMPOSE_PROJECT_NAME:-dataplatform}
+      UC_SERVICE: unitycatalog
+      # Talk to the FILTERED Docker API, not the raw socket. No docker.sock mount
+      # here anymore: the refresher can only do what the proxy allows (restart).
+      DOCKER_HOST: tcp://docker-socket-proxy:2375
+    entrypoint: ["/bin/sh", "/refresh/uc-cred-refresher.sh"]
+    volumes:
+      - ./infra/unitycatalog/refresh:/refresh:ro
+    networks: [admin]   # Phase 6: only reaches the docker-socket-proxy
+    restart: unless-stopped
+
+  # ----------------------------------------------------------
+  # Launchpad: one landing page linking to every tool (Superset, JupyterHub,
+  # Dagster, Keycloak account console, Unity Catalog UI, MinIO) with a short
+  # explanation of the single-identity / single-data-authority model.
+  # ----------------------------------------------------------
+  landing:
+    image: nginx:1.27-alpine
+    volumes:
+      - ./infra/landing/index.html:/usr/share/nginx/html/index.html:ro
+    # Phase 3: internal-only; browser access via the gateway (home.localtest.me).
+    expose:
+      - "80"
+
+  # oauth2-proxy in front of the home launchpad: log in ONCE at the front door,
+  # then every tool SSO's silently (shared Keycloak session). Reuses the dagster
+  # OIDC client (same as admin-auth); NO group restriction -- ANY authenticated
+  # user may see the general launchpad.
+  home-auth:
+    image: quay.io/oauth2-proxy/oauth2-proxy:v7.7.1
+    depends_on:
+      landing:
+        condition: service_started
+      keycloak:
+        condition: service_started
+    command:
+      - --config=/run/secrets-rendered/oauth2-proxy.cfg
+      - --http-address=0.0.0.0:4180
+      - --upstream=http://landing:80
+      - --provider=oidc
+      - --skip-oidc-discovery=true
+      - --oidc-issuer-url=${KEYCLOAK_BROWSER_BASE}/realms/${KC_REALM}
+      - --login-url=${KEYCLOAK_BROWSER_BASE}/realms/${KC_REALM}/protocol/openid-connect/auth
+      - --redeem-url=http://keycloak:8080/realms/${KC_REALM}/protocol/openid-connect/token
+      - --oidc-jwks-url=http://keycloak:8080/realms/${KC_REALM}/protocol/openid-connect/certs
+      - --insecure-oidc-skip-issuer-verification=true
+      - --client-id=dagster
+      - --redirect-url=https://home.localtest.me/oauth2/callback
+      # Allow the sign-out link to chain to the Keycloak end-session URL.
+      - --whitelist-domain=keycloak.localtest.me
+      - --reverse-proxy=true
+      - --cookie-secure=true
+      - --cookie-samesite=lax
+      - --skip-provider-button=true
+      - --email-domain=*
+      - --scope=openid email profile
+    volumes:
+      - secrets_render:/run/secrets-rendered:ro
+    expose:
+      - "4180"
+    restart: unless-stopped
+
+  # ----------------------------------------------------------
+  # Admin console (privileged/break-glass launchpad), served ONLY behind an
+  # oauth2-proxy restricted to the platform-admin group. Two parts:
+  #   admin-landing: a DEDICATED nginx serving admin.html (the public `landing`
+  #                  no longer serves it -- defense in depth).
+  #   admin-auth   : oauth2-proxy gate (Keycloak SSO, group=platform-admin only).
+  # Only reachable via the gateway host admin.localtest.me -> admin-auth.
+  # ----------------------------------------------------------
+  admin-landing:
+    image: nginx:1.27-alpine
+    volumes:
+      - ./infra/landing/admin.html:/usr/share/nginx/html/index.html:ro
+    expose:
+      - "80"
+    restart: unless-stopped
+
+  admin-auth:
+    image: quay.io/oauth2-proxy/oauth2-proxy:v7.7.1
+    depends_on:
+      admin-landing:
+        condition: service_started
+      keycloak:
+        condition: service_started
+    # Reuses the `dagster` OIDC client (its client_secret + cookie_secret are in
+    # the Vault-rendered oauth2-proxy.cfg); the platform-admin restriction is
+    # enforced HERE, not by the client. Tightened vs the Dagster gate: secure
+    # cookies (behind Caddy TLS), short admin session, no token pass-through.
+    command:
+      - --config=/run/secrets-rendered/oauth2-proxy.cfg
+      - --http-address=0.0.0.0:4180
+      - --upstream=http://admin-landing:80
+      - --provider=oidc
+      - --skip-oidc-discovery=true
+      - --oidc-issuer-url=${KEYCLOAK_BROWSER_BASE}/realms/${KC_REALM}
+      - --login-url=${KEYCLOAK_BROWSER_BASE}/realms/${KC_REALM}/protocol/openid-connect/auth
+      - --redeem-url=http://keycloak:8080/realms/${KC_REALM}/protocol/openid-connect/token
+      - --oidc-jwks-url=http://keycloak:8080/realms/${KC_REALM}/protocol/openid-connect/certs
+      - --insecure-oidc-skip-issuer-verification=true
+      - --client-id=dagster
+      - --redirect-url=https://admin.localtest.me/oauth2/callback
+      # Allow the sign-out link to redirect on to the Keycloak end-session URL.
+      - --whitelist-domain=keycloak.localtest.me
+      # Browser reaches us over HTTPS via Caddy; trust its X-Forwarded-* so
+      # Secure cookies work, and force them (tighter than the Dagster gate).
+      - --reverse-proxy=true
+      - --cookie-secure=true
+      - --cookie-expire=1h
+      - --cookie-samesite=lax
+      - --skip-provider-button=true
+      - --email-domain=*
+      - --scope=openid email profile
+      # ONLY platform-admins may load the admin console (least privilege).
+      - --oidc-groups-claim=groups
+      - --allowed-group=platform-admin
+    volumes:
+      - secrets_render:/run/secrets-rendered:ro
+    expose:
+      - "4180"
+    restart: unless-stopped
+
+networks:
+  # Phase 6 segmentation. `default` is the APP tier (UIs + orchestration + the
+  # backends they legitimately use: postgres metadata, keycloak, unitycatalog,
+  # spark-connect). `data` is the storage/compute tier (minio + spark) that
+  # app-facing services must NOT reach directly -- they go through
+  # spark-connect -> spark -> UC. `admin` holds the secret store + docker-socket
+  # proxy, reachable only by the automation/admin sidecars that need them.
+  default:
+  data:
+  admin:
+
+volumes:
+  postgres_data:
+  minio_data:
+  uc_conf:
+  uc_data:
+  ivy_cache:
+  connect_tls:
+  # Phase 2 (Vault): durable secret store + init keys, the runtime-only rendered
+  # secret env volume, and the Vault-rendered Keycloak realm import dir.
+  vault_file:
+  vault_keys:
+  secrets_render:
+  kc_import:
+  # Phase 3 (gateway): Caddy state incl. its local CA root (trusted by UC).
+  caddy_data:
+  caddy_config:

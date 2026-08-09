@@ -1,0 +1,198 @@
+# ============================================================
+# Hierarchical IAM policy — the SOURCE OF TRUTH for the namespace topology,
+# persona capabilities, group->persona mapping, teams, and inheritance. The IAM
+# reconciler (sync_group_grants.py) reads this and flattens it into explicit
+# per-principal Unity Catalog grants (UC OSS has no native group/role principal).
+#
+# Split of duties:
+#   * POLICY (this file)      -> code, git-reviewed  (topology + what a persona can do)
+#   * MEMBERSHIP (Keycloak)   -> UI / org SSO         (who is in a group)
+#
+# 'can_create_service_accounts' marks delegated-admin personas; 'max_scope'
+# bounds what they may delegate (catalog | schema:<name>).
+#
+# MANAGED-ONLY (Phase 5 hardening): every grant below is catalog/schema-level
+# only. NO persona is granted an EXTERNAL LOCATION, a STORAGE CREDENTIAL, or
+# CREATE EXTERNAL TABLE, so the managed storage root (s3://lakehouse/managed)
+# cannot be hijacked by pointing a new table's LOCATION at another table's files
+# (verified by the smoke harness 'G5 managed un-hijackable' probe). dbt/dlt emit
+# only MANAGED tables, so this loses no functionality. CLOUD: if external tables
+# are ever needed, broker path registration through an admin-only registrar --
+# never grant CREATE EXTERNAL LOCATION to teams.
+# ============================================================
+
+# ------------------------------------------------------------
+# NAMESPACE MODEL — how this org maps its organizational axes onto Unity
+# Catalog's fixed 3-level namespace (catalog.schema.table). Change ONLY this
+# block to switch topology; personas/teams/reconciler stay the same. See
+# iam_namespace.py for the full engine.
+#
+#   dimensions        : named axes + their allowed values.
+#   catalog_template  : how a CATALOG name is composed from dimensions.
+#   schema_template   : how a SCHEMA name is composed from dimensions.
+#   primary_catalog   : default catalog used by non-data tooling / provisioning.
+#
+# Placeholders in the templates MUST be dimension names. Dimensions that appear
+# in catalog_template are "catalog-forming"; those in schema_template are
+# "schema-forming". Grants are expanded over the cartesian product of the
+# relevant dimensions (optionally narrowed by a persona/team `scope:` or a
+# per-grant `where:`).
+#
+# INDUSTRY TOPOLOGIES — each is just a different `namespace:` (nothing else
+# changes). The active config below is the single-catalog / medallion default.
+#   * single catalog (default):
+#       dimensions: {domain: [analytics], layer: [bronze, silver, gold]}
+#       catalog_template: "{domain}"        schema_template: "{layer}"
+#   * catalog-per-env:
+#       dimensions: {env: [dev, prod], layer: [bronze, silver, gold]}
+#       catalog_template: "{env}"           schema_template: "{layer}"
+#   * env x domain (env folded into catalog name):
+#       dimensions: {env: [dev, prod], domain: [finance, marketing], layer: [...]}
+#       catalog_template: "{env}_{domain}"  schema_template: "{layer}"
+#   * catalog-per-team:
+#       dimensions: {team: [analytics, growth], layer: [...]}
+#       catalog_template: "{team}"          schema_template: "{layer}"
+#   * catalog-per-tenant (multi-tenant SaaS):
+#       dimensions: {tenant: [acme, globex], layer: [...]}
+#       catalog_template: "{tenant}"        schema_template: "{layer}"
+#   * medallion-as-catalog:
+#       dimensions: {layer: [bronze, silver, gold], domain: [finance, marketing]}
+#       catalog_template: "{layer}"         schema_template: "{domain}"
+# ------------------------------------------------------------
+namespace:
+  dimensions:
+    domain: [analytics]
+    layer:  [bronze, silver, gold]
+  catalog_template: "{domain}"
+  schema_template:  "{layer}"
+  primary_catalog:  analytics
+
+# Legacy alias for non-data tooling that still reads PERSONAS["catalog"].
+# Kept equal to namespace.primary_catalog; safe to remove once all consumers
+# read the namespace model.
+catalog: analytics
+
+# ROLE INHERITANCE: a Keycloak COMPOSITE realm role that automatically INCLUDES
+# every team-<name> role, so its holder sits ABOVE all teams (can launch any
+# team's pipelines) and new teams roll up automatically. Set to null to disable.
+# BREAK-GLASS: with this set, the admin INHERITS the union of all teams' DATA
+# grants (can SELECT any team's tables via real UC grants). For least-privilege /
+# multi-tenant orgs, set to `null` and grant admins data explicitly. See
+# SECURITY.md section 9 "Break-glass admin (opt-out of data inheritance)".
+umbrella_admin_role: platform-admin
+
+# AUTOMATION IDENTITIES: service accounts Dagster runs authenticate as. The
+# reconciler AUTO-PROVISIONS each declared SA: creates the Keycloak client
+# `sa-<name>` (passwordless client-credentials), writes its secret to Vault
+# (secret/platform/sa/sa-<name>, where Dagster's VaultSecretProvider reads it at
+# runtime), registers the UC principal, and materializes its persona's grants.
+#
+# `default_service_account` = the identity for UNTAGGED runs. It is deliberately
+# LEAST-PRIVILEGE (`platform-automation` persona = catalog visibility only, no
+# data). This removes the "god-mode default" foot-gun: an untagged pipeline can
+# see the catalog exists but can read/write NO data, so teams have a real
+# incentive to tag their jobs with `team: <name>` and run as their (builder)
+# team SA. Real data work therefore always flows through a scoped team identity.
+automation:
+  default_service_account:
+    name: platform-automation          # -> Keycloak client sa-platform-automation
+    persona: platform-automation       # least privilege (USE CATALOG only)
+
+# GROUP EMULATION: each Keycloak group -> (a) the persona whose grant template
+# every member inherits, and (b) the realm_roles members inherit for app-layer
+# access (Superset feature roles, sa-creator entitlement). Manage people in the
+# group; the reconciler keeps UC grants in sync (add on join, revoke on leave,
+# revoke on disable).
+groups:
+  analysts:
+    persona: analyst
+    realm_roles: [analyst]
+  data-engineers:
+    persona: data-engineer
+    realm_roles: [data-engineer, sa-creator]
+  platform-admins:
+    persona: platform-admin
+    realm_roles: [sa-creator, platform-admin]
+
+# TEAM LAUNCH SCOPE: a team scopes WHICH Dagster pipelines a member may launch
+# (a job tagged `team: <name>` requires the launcher to hold the `team-<name>`
+# realm role). The reconciler provisions each team declaratively: it ensures the
+# `team-<name>` realm role + a Keycloak group `team-<name>` carrying it. `grants`
+# is the default DATA scope every team member inherits (the umbrella admin
+# inherits the UNION of all teams' grants). Orthogonal to the automation service
+# account the DAG runs as (client `sa-team-<team>`, auto-provisioned below).
+#
+# If you adopt a per-team topology (add a `team` dimension + catalog_template
+# "{team}"), the reconciler auto-scopes each team's grants to its own value, so
+# `team: analytics` lands in catalog `analytics` automatically.
+teams:
+  analytics:
+    group: team-analytics
+    description: "Analytics team: may launch analytics-tagged Dagster pipelines"
+    # The team's AUTOMATION identity (auto-provisioned by the reconciler). Runs
+    # tagged `team: analytics` authenticate as this SA. It is a BUILDER
+    # (data-engineer) so the team's pipelines can write bronze/silver/gold --
+    # distinct from the members' READ scope in `grants` below.
+    # A team may run MULTIPLE service accounts, one per FUNCTION, each with its
+    # own persona -- least privilege WITHIN the team. Client ids are derived by
+    # convention `sa-team-<team>-<role>` (auto-provisioned by the reconciler;
+    # Dagster resolves the same, falling back to the single `sa-team-<team>` if a
+    # role SA isn't provisioned). Here the ingestion identity can write ONLY
+    # bronze, while the builder owns silver/gold -- so a compromised ingest job
+    # can't reach curated data.
+    #
+    # (Shorthand: for one SA per team use singular `service_account: {persona: X}`
+    #  -> client `sa-team-<team>`; both forms are supported.)
+    service_accounts:
+      ingest: { persona: ingestion-bot }   # -> sa-team-analytics-ingest (bronze only)
+      build:  { persona: data-engineer }   # -> sa-team-analytics-build  (silver/gold)
+    # DATA scope every human team MEMBER inherits (read-only gold here).
+    grants:
+      - {level: catalog, privilege: USE CATALOG}
+      - {level: schema, where: {layer: [gold]}, privileges: [USE SCHEMA, SELECT]}
+
+# PERSONAS: named grant templates applied to every member of a mapped group.
+# Grants use LEVEL (catalog|schema) + optional `where:` dimension filters; the
+# reconciler expands them over the namespace. Omitting `where` for a dimension
+# means "all of that dimension's values".
+personas:
+  platform-automation:
+    description: "Least-privilege default automation identity. Catalog visibility only — NO data read/write. Untagged Dagster runs use this, so real work must be team-tagged."
+    can_create_service_accounts: false
+    max_scope: catalog
+    grants:
+      - {level: catalog, privilege: USE CATALOG}
+
+  platform-admin:
+    description: "Metastore-level admin. May create schemas and provision any service account."
+    can_create_service_accounts: true
+    max_scope: catalog
+    grants:
+      - {level: catalog, privileges: [USE CATALOG, CREATE SCHEMA]}
+
+  data-engineer:
+    description: "Full builder across every layer: read + write all medallion schemas. May provision build/ingest SAs within the catalog."
+    can_create_service_accounts: true
+    max_scope: catalog
+    grants:
+      - {level: catalog, privilege: USE CATALOG}
+      # all layers (no `where` -> bronze, silver, gold)
+      - {level: schema, privileges: [USE SCHEMA, CREATE TABLE, MODIFY, SELECT]}
+
+  ingestion-bot:
+    description: "Automated ingestion identity. Reads + writes ONLY the bronze landing layer (never silver/gold)."
+    can_create_service_accounts: false
+    max_scope: schema:bronze
+    grants:
+      - {level: catalog, privilege: USE CATALOG}
+      # Bronze read+write (SELECT lets the loader read back its own layer); NO
+      # grant on silver/gold, so an ingest SA cannot touch curated data.
+      - {level: schema, where: {layer: [bronze]}, privileges: [USE SCHEMA, CREATE TABLE, MODIFY, SELECT]}
+
+  analyst:
+    description: "Read-only consumer of the gold layer."
+    can_create_service_accounts: false
+    max_scope: schema:gold
+    grants:
+      - {level: catalog, privilege: USE CATALOG}
+      - {level: schema, where: {layer: [gold]}, privileges: [USE SCHEMA, SELECT]}

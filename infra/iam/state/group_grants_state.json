@@ -1,0 +1,111 @@
+{
+  "managed": {
+    "analyst@platform.local": [
+      {
+        "name": "analytics",
+        "privilege": "USE CATALOG",
+        "securable": "catalog"
+      },
+      {
+        "name": "analytics.gold",
+        "privilege": "USE SCHEMA",
+        "securable": "schema"
+      },
+      {
+        "name": "analytics.gold",
+        "privilege": "SELECT",
+        "securable": "schema"
+      }
+    ],
+    "engineer@platform.local": [
+      {
+        "name": "analytics",
+        "privilege": "USE CATALOG",
+        "securable": "catalog"
+      },
+      {
+        "name": "analytics.bronze",
+        "privilege": "USE SCHEMA",
+        "securable": "schema"
+      },
+      {
+        "name": "analytics.bronze",
+        "privilege": "CREATE TABLE",
+        "securable": "schema"
+      },
+      {
+        "name": "analytics.bronze",
+        "privilege": "MODIFY",
+        "securable": "schema"
+      },
+      {
+        "name": "analytics.bronze",
+        "privilege": "SELECT",
+        "securable": "schema"
+      },
+      {
+        "name": "analytics.silver",
+        "privilege": "USE SCHEMA",
+        "securable": "schema"
+      },
+      {
+        "name": "analytics.silver",
+        "privilege": "CREATE TABLE",
+        "securable": "schema"
+      },
+      {
+        "name": "analytics.silver",
+        "privilege": "MODIFY",
+        "securable": "schema"
+      },
+      {
+        "name": "analytics.silver",
+        "privilege": "SELECT",
+        "securable": "schema"
+      },
+      {
+        "name": "analytics.gold",
+        "privilege": "USE SCHEMA",
+        "securable": "schema"
+      },
+      {
+        "name": "analytics.gold",
+        "privilege": "CREATE TABLE",
+        "securable": "schema"
+      },
+      {
+        "name": "analytics.gold",
+        "privilege": "MODIFY",
+        "securable": "schema"
+      },
+      {
+        "name": "analytics.gold",
+        "privilege": "SELECT",
+        "securable": "schema"
+      }
+    ],
+    "platformadmin@platform.local": [
+      {
+        "name": "analytics",
+        "privilege": "USE CATALOG",
+        "securable": "catalog"
+      },
+      {
+        "name": "analytics",
+        "privilege": "CREATE SCHEMA",
+        "securable": "catalog"
+      },
+      {
+        "name": "analytics.gold",
+        "privilege": "USE SCHEMA",
+        "securable": "schema"
+      },
+      {
+        "name": "analytics.gold",
+        "privilege": "SELECT",
+        "securable": "schema"
+      }
+    ]
+  },
+  "version": 1
+}

@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "spark-connect-uc"
+version = "0.1.0"
+description = "Superset connector: Spark Connect with per-user Unity Catalog RBAC"
+requires-python = ">=3.9"
+dependencies = []
+
+# Superset discovers engine specs and SQLAlchemy dialects via entry points
+# (superset/db_engine_specs/__init__.py). Mounting the source is not enough;
+# these registrations come from installed distribution metadata.
+[project.entry-points."superset.db_engine_specs"]
+spark_connect_uc = "spark_connect_uc.db_engine_spec:SparkConnectUCEngineSpec"
+
+[project.entry-points."sqlalchemy.dialects"]
+spark_connect_uc = "spark_connect_uc.sqlalchemy_dialect:SparkConnectUCDialect"
+
+[tool.setuptools]
+packages = ["spark_connect_uc"]
