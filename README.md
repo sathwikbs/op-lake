@@ -566,8 +566,6 @@ dagster/data_platform/          # Dagster code location (dlt, bronze, dbt assets
   `sc://spark-connect:15003/;use_ssl=true;token=$SPARK_CONNECT_TOKEN` with
   `GRPC_DEFAULT_SSL_ROOTS_FILE_PATH=/certs/server.crt` (cross-container), or
   `sc://localhost:15002/;token=…` on the host.
-- **Managed table create fails with `uc_delta_commits does not exist`.** You're
-  on Postgres; use the H2 backend (default) until UC fixes #1364/#1446.
 - **Dagster shows no assets / import error.** Asset modules must **not** use
   `from __future__ import annotations` (PEP 563 stringifies the
   `context: AssetExecutionContext` hint, which Dagster 1.11 rejects).
