@@ -44,6 +44,25 @@ _db = os.environ.get("SUPERSET_DB", "superset")
 SQLALCHEMY_DATABASE_URI = f"postgresql+psycopg2://{_user}:{_pw}@{_host}:5432/{_db}"
 
 SQLALCHEMY_TRACK_MODIFICATIONS = False
+
+# Content Security Policy: Superset 4.1.1's default TALISMAN_CONFIG, minus the
+# scarf.sh hosts. The usage-telemetry pixel is compiled into the prebuilt
+# frontend, so the CSP is what stops it leaving the platform.
+TALISMAN_CONFIG = {
+    "content_security_policy": {
+        "base-uri": ["'self'"],
+        "default-src": ["'self'"],
+        "img-src": ["'self'", "blob:", "data:"],
+        "worker-src": ["'self'", "blob:"],
+        "connect-src": ["'self'", "https://api.mapbox.com", "https://events.mapbox.com"],
+        "object-src": "'none'",
+        "style-src": ["'self'", "'unsafe-inline'"],
+        "script-src": ["'self'", "'strict-dynamic'"],
+    },
+    "content_security_policy_nonce_in": ["script-src"],
+    "force_https": False,
+    "session_cookie_secure": False,
+}
 WTF_CSRF_ENABLED = True
 SUPERSET_WEBSERVER_TIMEOUT = 120
 
@@ -175,7 +194,11 @@ DATABASE_OAUTH2_CLIENTS = {
     "Spark Connect (Unity Catalog)": {
         "id": _client_id,
         "secret": _client_secret,
-        "scope": "openid email profile",
+        # offline_access: the stored refresh token is an offline token, so it is not
+        # tied to the browser SSO session (Keycloak's 30-min idle default) and
+        # dashboard viewers are not sent back to "Authorization needed". The
+        # reconciler still force-logs-out disabled users, offline sessions included.
+        "scope": "openid email profile offline_access",
         "authorization_request_uri": _authorize_url,
         "token_request_uri": _token_url,
     }
