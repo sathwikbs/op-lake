@@ -195,6 +195,14 @@ weaken the boundary — authorization is enforced per-proxy (`platform-admin`
 only), cookies are host-scoped (no cross-subdomain replay), and redirect URIs are
 exact controlled HTTPS URLs.
 
+Delegated Keycloak user administration: the `platform-admins` group carries the
+`realm-management` client roles `manage-users`, `view-users` and `query-groups`
+(see `infra/keycloak/realm-export.json`). Members may create and edit users, set
+credentials, and manage each user's group **membership** in the admin console
+(small-team mode, no org SSO). This does **not** let them create governed
+groups: group definitions stay in `personas.yaml` (code). Separation of duties:
+this is IdP user administration, distinct from the data-platform persona.
+
 ## 9. Deferred (next version / Kubernetes migration)
 
 - **Dedicated `admin-portal` OIDC client** for the admin console instead of
