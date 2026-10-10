@@ -23,24 +23,40 @@ while [ ! -s "${TOKEN_FILE}" ] && [ "$i" -lt 60 ]; do
   i=$((i + 1))
 done
 
-# Ensure Keycloak groups + realm-role attachments AND team launch roles/groups
-# exist once, then loop on the grant reconcile (idempotent, state-file driven).
-python3 /iam/sync_group_grants.py ensure-groups || \
-  echo "[iam-reconciler] ensure-groups failed (will still reconcile)"
-python3 /iam/sync_group_grants.py ensure-teams || \
-  echo "[iam-reconciler] ensure-teams failed (will still reconcile)"
-# Ensure the declared namespace (catalogs + schemas from personas.yaml) exists
-# so USE-CATALOG/USE-SCHEMA grants always have a target. Idempotent.
-python3 /iam/sync_group_grants.py bootstrap || \
-  echo "[iam-reconciler] bootstrap failed (will still reconcile)"
-# Provision declared service accounts (default automation SA + per-team SAs):
-# Keycloak client + Vault secret + UC principal + persona grants. This also
-# downgrades the default automation SA to least-privilege. Runs once (SA config
-# changes are rare); re-run `ensure-sas` after editing personas.yaml.
-python3 /iam/sync_group_grants.py ensure-sas || \
-  echo "[iam-reconciler] ensure-sas failed (grants still reconcile per-human)"
+# One-time provisioning, all idempotent. Each step needs Keycloak and UC, which
+# may still be starting when this container comes up, so the steps are retried
+# every interval until all of them succeed (a single failed attempt used to
+# leave the default automation SA un-downgraded until the next container start).
+provision() {
+  rc=0
+  # Keycloak groups + realm-role attachments AND team launch roles/groups.
+  python3 /iam/sync_group_grants.py ensure-groups || {
+    echo "[iam-reconciler] ensure-groups failed"; rc=1; }
+  python3 /iam/sync_group_grants.py ensure-teams || {
+    echo "[iam-reconciler] ensure-teams failed"; rc=1; }
+  # Ensure the declared namespace (catalogs + schemas from personas.yaml) exists
+  # so USE-CATALOG/USE-SCHEMA grants always have a target.
+  python3 /iam/sync_group_grants.py bootstrap || {
+    echo "[iam-reconciler] bootstrap failed"; rc=1; }
+  # Provision declared service accounts (default automation SA + per-team SAs):
+  # Keycloak client + Vault secret + UC principal + persona grants. This also
+  # downgrades the default automation SA to least-privilege. Re-run
+  # `ensure-sas` after editing personas.yaml.
+  python3 /iam/sync_group_grants.py ensure-sas || {
+    echo "[iam-reconciler] ensure-sas failed"; rc=1; }
+  return "$rc"
+}
 
+PROVISIONED=0
 while true; do
+  if [ "$PROVISIONED" = 0 ]; then
+    if provision; then
+      PROVISIONED=1
+      echo "[iam-reconciler] provisioning complete"
+    else
+      echo "[iam-reconciler] provisioning incomplete; retrying in ${INTERVAL}s (grants still reconcile per-human)"
+    fi
+  fi
   echo "[iam-reconciler] $(date -u '+%Y-%m-%dT%H:%M:%SZ') reconcile"
   python3 /iam/sync_group_grants.py reconcile || \
     echo "[iam-reconciler] reconcile failed (will retry next interval)"
