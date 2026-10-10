@@ -1,5 +1,8 @@
 # Rendered at container start via envsubst (see entrypoint.sh).
 spark.master                                   local[*]
+# Driver heap. In local mode every session AND every task share this one JVM;
+# Spark's 1g default ran out of memory (exit 52) under a BI load test.
+spark.driver.memory                            ${SPARK_DRIVER_MEMORY}
 
 # --- Spark Connect (dbt + Dagster + Jupyter connect here) ---
 spark.connect.grpc.binding.port                15002
