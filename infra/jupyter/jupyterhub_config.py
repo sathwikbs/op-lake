@@ -56,7 +56,10 @@ c.GenericOAuthenticator.token_url = (
 # JWT (same approach Superset uses). auth_state still captures the access_token +
 # refresh_token from the token response for the notebook.
 c.GenericOAuthenticator.userdata_from_id_token = True
-c.GenericOAuthenticator.scope = ["openid", "email", "profile"]
+# offline_access: the refresh token handed to each notebook server is an offline
+# token, so it is not tied to the browser SSO session (Keycloak's 30-min idle
+# default) and a long-running server keeps minting fresh access tokens.
+c.GenericOAuthenticator.scope = ["openid", "email", "profile", "offline_access"]
 c.GenericOAuthenticator.username_claim = "preferred_username"
 # Any authenticated realm user may log in; DATA access is enforced downstream by
 # Unity Catalog per user (an analyst simply sees only what they're granted).

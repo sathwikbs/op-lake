@@ -172,6 +172,7 @@
       ],
       "webOrigins": ["*"],
       "defaultClientScopes": ["profile", "email", "roles", "web-origins", "basic"],
+      "optionalClientScopes": ["offline_access"],
       "protocolMappers": [
         {
           "name": "aud-unitycatalog",
