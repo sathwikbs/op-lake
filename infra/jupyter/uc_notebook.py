@@ -16,8 +16,10 @@ there is no ambient admin identity on the compute edge.
 """
 from __future__ import annotations
 
+import base64
 import json
 import os
+import time
 import urllib.parse
 import urllib.request
 
@@ -63,7 +65,7 @@ def _kc_access_token() -> str:
             if r.get("refresh_token"):
                 os.environ["KC_REFRESH_TOKEN"] = r["refresh_token"]
             return r["access_token"]
-        except Exception:  # noqa: BLE001 - fall back to the injected token
+        except Exception:  # noqa: BLE001 - fall back to the injected token if still valid
             pass
     tok = os.environ.get("KC_ACCESS_TOKEN")
     if not tok:
@@ -71,7 +73,23 @@ def _kc_access_token() -> str:
             "No Keycloak token in this notebook's environment. Are you running "
             "under JupyterHub SSO? (KC_ACCESS_TOKEN unset)"
         )
+    if _expired(tok):
+        raise RuntimeError(
+            "Your Keycloak login for this notebook server has expired. Open "
+            "File > Hub Control Panel, stop your server and start it again to sign in."
+        )
     return tok
+
+
+def _expired(jwt: str, margin: int = 30) -> bool:
+    """True if the JWT's `exp` is in the past (decoded locally, not verified)."""
+    try:
+        payload = jwt.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        exp = json.loads(base64.urlsafe_b64decode(payload)).get("exp")
+    except Exception:  # noqa: BLE001 - not a JWT: let Unity Catalog decide
+        return False
+    return bool(exp) and exp <= time.time() + margin
 
 
 def uc_token() -> str:

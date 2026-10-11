@@ -144,6 +144,7 @@
       ],
       "webOrigins": ["*"],
       "defaultClientScopes": ["profile", "email", "roles", "web-origins", "basic"],
+      "optionalClientScopes": ["offline_access"],
       "protocolMappers": [
         {
           "name": "aud-unitycatalog",
@@ -171,6 +172,7 @@
       ],
       "webOrigins": ["*"],
       "defaultClientScopes": ["profile", "email", "roles", "web-origins", "basic"],
+      "optionalClientScopes": ["offline_access"],
       "protocolMappers": [
         {
           "name": "aud-unitycatalog",
@@ -333,7 +335,6 @@
       "path": "/platform-admins",
       "attributes": { "uc_persona": ["platform-admin"] },
       "realmRoles": ["sa-creator", "platform-admin"],
-      "_clientRoles_comment": "Delegated Keycloak user administration: members may create/edit users, set credentials, and manage each user's group MEMBERSHIP in the admin console (small-team mode, no org SSO). This does NOT let them create governed groups -- group definitions stay in personas.yaml (code). Separation of duties: this is IdP user-admin, distinct from the data-platform persona.",
       "clientRoles": {
         "realm-management": ["manage-users", "view-users", "query-groups"],
         "minio": ["platform-admin"]

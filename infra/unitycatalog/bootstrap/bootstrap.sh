@@ -60,31 +60,11 @@ grant catalog "${CATALOG}"        "USE CATALOG" analyst@platform.local
 grant schema  "${CATALOG}.gold"   "USE SCHEMA"  analyst@platform.local
 grant schema  "${CATALOG}.gold"   "SELECT"      analyst@platform.local
 
-# ---------------------------------------------------------------------------
-# Automation service accounts (identity is seeded in the Keycloak realm as the
-# confidential clients `sa-platform-automation` + `sa-team-analytics`; here we
-# register their UC principals + data-plane grants so a fresh `down -v && up`
-# comes up with a WORKING automation plane -- no manual provisioning step).
-# These are the DAG-run identities: Dagster exchanges each SA's client-creds for
-# a UC token (see data_platform.uc_identity). They build the full medallion, so
-# they get the data-engineer builder template. Additional SAs are still created
-# on demand via the delegated-admin flow (provision_service_account.py).
-# UC principal email MUST match each client's hardcoded `email` claim.
-# ---------------------------------------------------------------------------
-echo ">> Registering automation service-account principals"
-uc user create --name "Platform Automation SA" --email sa-platform-automation@platform.local 2>/dev/null || true
-uc user create --name "Analytics Team SA"       --email sa-team-analytics@platform.local     2>/dev/null || true
-
-for sa_email in sa-platform-automation@platform.local sa-team-analytics@platform.local; do
-  echo ">> RBAC: ${sa_email} = builder on all layers (data-engineer template)"
-  grant catalog "${CATALOG}" "USE CATALOG" "${sa_email}"
-  for schema in bronze silver gold; do
-    grant schema "${CATALOG}.${schema}" "USE SCHEMA"   "${sa_email}"
-    grant schema "${CATALOG}.${schema}" "CREATE TABLE" "${sa_email}"
-    grant schema "${CATALOG}.${schema}" "MODIFY"       "${sa_email}"
-    grant schema "${CATALOG}.${schema}" "SELECT"       "${sa_email}"
-  done
-done
+# Automation service accounts are NOT granted here. The iam-reconciler
+# (`ensure-sas`) owns their Keycloak clients, UC principals and grants from
+# personas.yaml. Granting them builder rights here re-escalated the default
+# automation SA (catalog-only by design) on every `docker compose up` that ran
+# this one-shot after the reconciler had started (smoke check G6).
 
 echo ">> Bootstrap complete. Current catalog/schema layout:"
 uc schema list --catalog "${CATALOG}" || true

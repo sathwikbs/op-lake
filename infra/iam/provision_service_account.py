@@ -47,6 +47,25 @@ PERSONAS = yaml.safe_load((HERE / "personas.yaml").read_text())
 NS = iam_namespace.Namespace(PERSONAS)
 AUDIT_LOG = HERE / "audit.log"
 
+
+def _load_rendered_secrets() -> None:
+    """`docker exec` skips the entrypoint's inject.sh, so load this service's
+    Vault-rendered env file here as well (values already in the env win)."""
+    name = os.environ.get("SECRETS_FILE")
+    if not name:
+        return  # host run: nothing rendered to load
+    path = Path(os.environ.get("SECRETS_DIR", "/run/secrets-rendered")) / f"{name}.env"
+    if not path.is_file():
+        return
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            k, v = line.split("=", 1)
+            os.environ.setdefault(k, v)
+
+
+_load_rendered_secrets()
+
 KC_BASE = os.environ.get("KC_BASE", "https://keycloak.localtest.me")
 REALM = os.environ.get("KC_REALM", "datalake")
 UC_CONTAINER = os.environ.get("UC_CONTAINER", "dataplatform-unitycatalog-1")

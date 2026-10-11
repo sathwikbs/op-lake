@@ -21,7 +21,7 @@ from typing import Any
 from superset.db_engine_specs.base import BaseEngineSpec
 
 from .dbapi import SparkConnectOAuth2Error
-from .token_exchange import exchange_kc_for_uc
+from .token_exchange import exchange_kc_for_uc_cached
 
 logger = logging.getLogger(__name__)
 
@@ -36,7 +36,7 @@ class SparkConnectUCEngineSpec(BaseEngineSpec):
 
     # Unity Catalog is the authority; identity is per-user via OAuth2 + exchange.
     supports_oauth2 = True
-    oauth2_scope = "openid email profile"
+    oauth2_scope = "openid email profile offline_access"
     oauth2_exception = SparkConnectOAuth2Error
 
     # Spark SQL time-grain expressions (enough for typical BI on gold tables).
@@ -74,7 +74,7 @@ class SparkConnectUCEngineSpec(BaseEngineSpec):
             logger.info("spark_connect_uc: no access_token for %s; will trigger OAuth2", username)
             return
         try:
-            connect_args["uc_token"] = exchange_kc_for_uc(access_token)
+            connect_args["uc_token"] = exchange_kc_for_uc_cached(access_token)
             logger.info("spark_connect_uc: injected per-user UC token for %s", username)
         except Exception as ex:  # noqa: BLE001
             # Surface as an OAuth2 need so the user can re-auth; never fall back.
@@ -102,7 +102,12 @@ class SparkConnectUCEngineSpec(BaseEngineSpec):
     # override both exchanges to send form-encoded data.
     # ------------------------------------------------------------------
     @classmethod
-    def _token_request(cls, config: dict[str, Any], extra: dict[str, str]) -> dict[str, Any]:
+    def _token_request(
+        cls,
+        config: dict[str, Any],
+        extra: dict[str, str],
+        raise_on_error: bool = True,
+    ) -> dict[str, Any]:
         import requests
         from flask import current_app
 
@@ -119,6 +124,10 @@ class SparkConnectUCEngineSpec(BaseEngineSpec):
         )
         payload = response.json()
         if "access_token" not in payload:
+            if not raise_on_error:
+                logger.info("spark_connect_uc: OAuth2 token request rejected: %s",
+                            payload.get("error", payload))
+                return payload
             raise SparkConnectOAuth2Error(f"OAuth2 token request failed: {payload}")
         return payload
 
@@ -137,10 +146,16 @@ class SparkConnectUCEngineSpec(BaseEngineSpec):
     def get_oauth2_fresh_token(
         cls, config: dict[str, Any], refresh_token: str
     ) -> dict[str, Any]:
+        # Once the Keycloak session behind the refresh token ends, Keycloak answers
+        # `invalid_grant` ("Token is not active"). Superset core treats a refresh
+        # response without ``access_token`` as "re-authorize" and restarts the
+        # OAuth2 dance, so hand the payload back instead of raising (raising
+        # surfaced a raw database error in SQL Lab and never offered the link).
         return cls._token_request(
             config,
             {
                 "refresh_token": refresh_token,
                 "grant_type": "refresh_token",
             },
+            raise_on_error=False,
         )
